@@ -1,0 +1,8 @@
+ultralytics>=8.0.0
+opencv-python
+streamlit
+numpy
+scipy
+openai
+python-dotenv
+imageio-ffmpeg

@@ -1,0 +1,18 @@
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment variables and secrets
+.env
+
+# Editor and workspace settings
+.cursor/
+.vscode/
+logs/
+test_files/
+.tests/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
