@@ -32,7 +32,7 @@ class PunchCycleDetectorTests(unittest.TestCase):
         )
 
     def test_one_frame_pose_jump_is_not_a_punch(self) -> None:
-        detector = PunchDetector()
+        detector = PunchDetector(refractory_frames=3)
         self._sample(detector, 0, reach=1.00, extension_velocity=0.0, speed=0.0)
         self._sample(detector, 1, reach=1.10, extension_velocity=2.5)
         event = self._sample(
@@ -43,7 +43,7 @@ class PunchCycleDetectorTests(unittest.TestCase):
         self.assertEqual(detector.summary(1.0)["total_punches"], 0)
 
     def test_partial_retraction_rearms_before_twelve_frames(self) -> None:
-        detector = PunchDetector()
+        detector = PunchDetector(refractory_frames=3)
         self._sample(detector, 0, reach=1.00, extension_velocity=0.0, speed=0.0)
         self._sample(detector, 1, reach=1.05, extension_velocity=0.6)
         self._sample(detector, 2, reach=1.12, extension_velocity=0.5)
@@ -64,7 +64,7 @@ class PunchCycleDetectorTests(unittest.TestCase):
         self.assertEqual(detector.phase("left"), PunchPhase.RETRACTING)
 
     def test_fast_motion_without_outward_reach_is_ignored(self) -> None:
-        detector = PunchDetector()
+        detector = PunchDetector(refractory_frames=3)
         for frame in range(8):
             self._sample(
                 detector,

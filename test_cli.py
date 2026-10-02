@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from core.fatigue_analyzer import FatigueAnalyzer
+from core.boxer_pipeline import TrackedBoxerPosePipeline
 from core.guard_monitor import GuardMonitor
 from core.kinematics import PoseSignalProcessor, WristMotionTracker, calculate_angle
 from core.logging_config import configure_logging
@@ -50,17 +51,17 @@ def analyze_video(
     stance: str,
     max_seconds: float,
     *,
-    min_speed: float = 0.70,
-    min_extension_speed: float = 0.25,
-    min_extension_gain: float = 0.06,
-    min_retraction_gain: float = 0.04,
-    refractory_frames: int = 3,
+    min_speed: float = 0.30,
+    min_extension_speed: float = 0.10,
+    min_extension_gain: float = 0.04,
+    min_retraction_gain: float = 0.02,
+    refractory_frames: int = 9,
     max_refractory_frames: int = 12,
     max_wrist_speed: float = 20.0,
     max_extension_gain: float = 1.40,
     max_extension_velocity: float = 25.0,
     min_outward_frames: int = 2,
-    min_count_angle: float = 45.0,
+    min_count_angle: float = 20.0,
     savgol_window: int = 5,
     diagnostics_csv: Path | None = None,
     expected_count: int | None = None,
@@ -88,7 +89,11 @@ def analyze_video(
     dt = 1.0 / fps
     max_frames = max(1, int(round(max_seconds * fps)))
 
-    engine = PoseEngine(weights="yolov8n-pose.pt", confidence_threshold=0.25)
+    engine = PoseEngine(weights="yolo11s-pose.pt", confidence_threshold=0.25)
+    vision_pipeline = TrackedBoxerPosePipeline(
+        pose_engine=engine,
+        detector_weights="yolo11s-pose.pt",
+    )
     detector = PunchDetector(
         stance=stance,
         refractory_frames=refractory_frames,
@@ -120,6 +125,7 @@ def analyze_video(
     signal_processor = PoseSignalProcessor(
         window_length=savgol_window,
         polynomial_order=2,
+        sample_frequency=fps,
     )
     motion_tracker = WristMotionTracker()
     diagnostic_rows: list[dict[str, object]] = []
@@ -155,8 +161,9 @@ def analyze_video(
                 break
 
             timestamp = frame_index / fps
-            raw_keypoints = engine.extract_keypoints(frame, imgsz=imgsz)
-            processed_pose = signal_processor.update(raw_keypoints)
+            stages = vision_pipeline.process(frame, inference_size=imgsz)
+            raw_keypoints = stages.raw_keypoints_original
+            processed_pose = signal_processor.update(raw_keypoints, timestamp=timestamp)
             keypoints = (
                 processed_pose.normalized_keypoints
                 if processed_pose is not None
@@ -288,23 +295,23 @@ def main() -> int:
         default=30.0,
         help="Maximum video duration to process (default: 30)",
     )
-    parser.add_argument("--min-speed", type=float, default=0.70)
-    parser.add_argument("--min-extension-speed", type=float, default=0.25)
-    parser.add_argument("--min-extension-gain", type=float, default=0.06)
-    parser.add_argument("--min-retraction-gain", type=float, default=0.04)
-    parser.add_argument("--refractory-frames", type=int, default=3)
+    parser.add_argument("--min-speed", type=float, default=0.30)
+    parser.add_argument("--min-extension-speed", type=float, default=0.10)
+    parser.add_argument("--min-extension-gain", type=float, default=0.04)
+    parser.add_argument("--min-retraction-gain", type=float, default=0.02)
+    parser.add_argument("--refractory-frames", type=int, default=9)
     parser.add_argument("--max-refractory-frames", type=int, default=12)
     parser.add_argument("--max-wrist-speed", type=float, default=20.0)
     parser.add_argument("--max-extension-gain", type=float, default=1.40)
     parser.add_argument("--max-extension-velocity", type=float, default=25.0)
     parser.add_argument("--min-outward-frames", type=int, default=2)
-    parser.add_argument("--min-count-angle", type=float, default=45.0)
+    parser.add_argument("--min-count-angle", type=float, default=20.0)
     parser.add_argument(
         "--savgol-window",
         type=int,
         choices=(5, 7),
         default=5,
-        help="Savitzky-Golay window; polynomial order is fixed at 2",
+        help="Deprecated compatibility option; One-Euro filtering is now used",
     )
     parser.add_argument(
         "--diagnostics-csv",
@@ -319,9 +326,9 @@ def main() -> int:
     parser.add_argument(
         "--imgsz",
         type=int,
-        default=480,
-        choices=(320, 480, 640, 800),
-        help="YOLO inference size; larger is slower but may improve wrist tracking",
+        default=640,
+        choices=(480, 640),
+        help="Square YOLO letterbox size; source aspect ratio is preserved",
     )
     parser.add_argument("--guard-chin-fraction", type=float, default=0.65)
     parser.add_argument("--guard-wrist-tolerance", type=float, default=0.15)

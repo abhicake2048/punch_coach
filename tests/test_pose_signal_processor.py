@@ -1,4 +1,4 @@
-"""Tests for temporal smoothing and shoulder-relative normalization."""
+"""Tests for low-lag smoothing and torso-relative normalization."""
 
 from __future__ import annotations
 
@@ -6,7 +6,11 @@ import unittest
 
 import numpy as np
 
-from core.kinematics import PoseSignalProcessor, normalize_keypoints_by_shoulders
+from core.kinematics import (
+    PoseSignalProcessor,
+    normalize_keypoints_by_shoulders,
+    normalize_keypoints_by_torso,
+)
 
 
 def _point(x: float, y: float, confidence: float = 0.95) -> np.ndarray:
@@ -14,6 +18,22 @@ def _point(x: float, y: float, confidence: float = 0.95) -> np.ndarray:
 
 
 class PoseSignalProcessorTests(unittest.TestCase):
+    def test_torso_normalization_uses_neck_origin_and_torso_scale(self) -> None:
+        pose = {
+            "left_shoulder": _point(80.0, 100.0),
+            "right_shoulder": _point(120.0, 100.0),
+            "left_hip": _point(85.0, 200.0),
+            "right_hip": _point(115.0, 200.0),
+            "left_wrist": _point(100.0, 0.0),
+        }
+
+        normalized, torso_length, origin_name = normalize_keypoints_by_torso(pose)
+
+        assert normalized is not None
+        self.assertEqual(origin_name, "neck")
+        self.assertAlmostEqual(torso_length, 100.0)
+        np.testing.assert_allclose(normalized["left_wrist"][:2], [0.0, -1.0])
+
     def test_shoulder_midpoint_is_origin_and_width_is_one(self) -> None:
         pose = {
             "left_shoulder": _point(100.0, 100.0),
@@ -48,7 +68,7 @@ class PoseSignalProcessorTests(unittest.TestCase):
         for name in original:
             np.testing.assert_allclose(first[name][:2], second[name][:2], atol=1e-12)
 
-    def test_savgol_reduces_high_frequency_coordinate_error(self) -> None:
+    def test_low_pass_reduces_high_frequency_coordinate_error(self) -> None:
         processor = PoseSignalProcessor(window_length=5, polynomial_order=2)
         noise = [0.0, 4.0, -4.0, 4.0, -4.0, 4.0, -4.0]
         result = None

@@ -1,4 +1,4 @@
-"""CPU-only YOLOv8 pose inference and COCO keypoint parsing."""
+"""CPU-only YOLO11 pose inference and COCO keypoint parsing."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ BOXING_KEYPOINT_INDICES: Final[dict[str, int]] = {
 
 
 class PoseEngine:
-    """Run lightweight YOLOv8-pose inference on CPU.
+    """Run YOLO11-pose inference on CPU.
 
     The model file is downloaded automatically by Ultralytics when it is not
     already present. Model construction is deliberately kept in ``__init__``
@@ -57,7 +57,7 @@ class PoseEngine:
 
     def __init__(
         self,
-        weights: str | Path = "yolov8n-pose.pt",
+        weights: str | Path = "yolo11s-pose.pt",
         confidence_threshold: float = 0.25,
     ) -> None:
         """Load the requested pose weights and pin all inference to CPU."""
@@ -72,7 +72,7 @@ class PoseEngine:
     def extract_keypoints(
         self,
         frame: np.ndarray,
-        imgsz: int = 480,
+        imgsz: int | tuple[int, int] = (480, 640),
     ) -> dict[str, np.ndarray] | None:
         """Extract the primary person's 17 COCO keypoints from a BGR frame.
 
@@ -84,13 +84,17 @@ class PoseEngine:
 
         Args:
             frame: OpenCV-style BGR image.
-            imgsz: YOLO inference size. A default of 480 limits CPU cost.
+            imgsz: YOLO inference height/width. The pipeline uses a 480x640
+                aspect-preserving canvas rather than stretching source pixels.
         """
         if not isinstance(frame, np.ndarray) or frame.ndim not in (2, 3):
             raise ValueError("frame must be a 2D or 3D NumPy image array")
         if frame.size == 0:
             raise ValueError("frame cannot be empty")
-        if imgsz <= 0:
+        if isinstance(imgsz, tuple):
+            if len(imgsz) != 2 or any(int(value) <= 0 for value in imgsz):
+                raise ValueError("imgsz dimensions must be positive")
+        elif imgsz <= 0:
             raise ValueError("imgsz must be positive")
 
         results = self.model.predict(

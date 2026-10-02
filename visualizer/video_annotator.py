@@ -105,7 +105,7 @@ def draw_skeleton(
         if wrist is not None and speed is not None:
             cv2.putText(
                 annotated,
-                f"{speed:.2f} SW/s",
+                f"{speed:.2f} TL/s",
                 (wrist[0] + 8, wrist[1] + 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,

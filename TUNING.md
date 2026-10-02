@@ -27,13 +27,13 @@ python test_cli.py ".\test_files\4804863-uhd_3840_2160_25fps.mp4" `
   --diagnostics-csv ".\test_files\diagnostics_11s.csv"
 ```
 
-The CSV contains time, hand, Savitzky–Golay-smoothed shoulder-relative wrist
+The CSV contains time, hand, One-Euro-filtered torso-relative wrist
 speed, outward extension speed, reach, elbow angle, dynamic threshold,
 detector phase, and detections.
 Plot these columns or filter `detected=True` to audit each event.
 
-Regenerate diagnostics whenever the smoothing window, pose model, confidence
-threshold, or inference size changes. CSVs produced by an older signal pipeline
+Regenerate diagnostics whenever the filter, detector/pose weights, confidence
+threshold, or crop geometry changes. CSVs produced by an older signal pipeline
 must not be mixed into a new calibration.
 
 ## 3. Replay a parameter grid without rerunning YOLO
@@ -42,11 +42,11 @@ must not be mixed into a new calibration.
 python calibrate_detector.py `
   ".\test_files\diagnostics_11s.csv=18" `
   ".\test_files\diagnostics_15s.csv=45" `
-  --min-speeds "0.65,0.7,0.75" `
-  --extension-speeds "0.2,0.25,0.3" `
-  --extension-gains "0.05,0.06,0.07" `
-  --retraction-gains "0.03,0.04,0.05" `
-  --refractory-frames "2,3,4" `
+  --min-speeds "0.3,0.4,0.5" `
+  --extension-speeds "0.1,0.15,0.2" `
+  --extension-gains "0.03,0.04,0.05" `
+  --retraction-gains "0.02,0.03,0.04" `
+  --refractory-frames "8,9,10" `
   --max-extension-gains "1.3,1.4,1.5" `
   --max-extension-velocities "20,25" `
   --min-outward-frames "2" `
@@ -71,19 +71,19 @@ positives and false negatives.
 | Minimum cycle elbow angle | Accepts tightly bent motion | Rejects implausibly folded-arm cycles |
 | Maximum reach gain/outward speed | Permits extreme motion | Rejects more keypoint teleports |
 | Pose-jump rejection speed | Rejects more tracking jumps | Permits faster detected motion |
-| Savitzky–Golay window | 5 frames is more responsive | 7 frames rejects more jitter |
-| Inference size | Faster, less precise pose | Slower, often better wrists |
+| One-Euro minimum cutoff | Smoother but more lag | More responsive but more jitter |
+| One-Euro beta | Less speed adaptation | Less lag during fast punches |
 
-The default profile is calibrated jointly to the two included clips: 18 events
-in the 11-second clip and 45 events in the 15-second clip. It requires at least
-two outward-motion frames. After a count, a hand can re-arm in three frames
-only after measurable retraction; 12 frames is a safety ceiling for lost pose
-tracking, not a fixed lockout.
+The current profile was selected jointly from tracked diagnostics for the
+7-punch and 14-punch clips. It produced 5 and 14 counts respectively; that
+known residual error is preferable to the single-clip fit that produced 7 and
+37. It requires at least two outward-motion frames and a nine-frame same-hand
+rearm gap; 12 frames remains the safety ceiling for lost pose tracking.
 
-The current count profile is: Savitzky–Golay `5/2`, minimum wrist speed `0.70
-SW/s`, outward speed `0.25 SW/s`, reach gain `0.06 SW`, retraction `0.04 SW`,
-three-frame minimum gap, maximum reach gain `1.40 SW`, maximum outward speed
-`25 SW/s`, pose-jump limit `20 SW/s`, and minimum cycle angle `45°`.
+The count profile is: minimum wrist speed `0.30 TL/s`, outward speed `0.10
+TL/s`, reach gain `0.04 TL`, retraction `0.02 TL`, maximum reach gain `1.40 TL`,
+maximum outward speed `25 TL/s`, pose-jump limit `20 TL/s`, and minimum cycle
+angle `20°`. `TL` means torso length.
 
 Change one parameter family at a time. For rapid combinations, first lower the
 partial-retraction requirement slightly; do not reduce minimum outward-motion
@@ -98,14 +98,18 @@ clips and then verify the winning profile on a separate holdout video.
 ## Pose signal processing
 
 Raw YOLO coordinates never feed velocity, angle, guard, or punch logic. Each
-coordinate first passes through a trailing Savitzky–Golay filter with polynomial
-order 2 and a selectable 5- or 7-frame window. The smoothed shoulder midpoint
-is then subtracted from every point and all coordinates are divided by smoothed
-shoulder width. Smoothed pixel coordinates are retained only for drawing.
+coordinate first passes through an adaptive One-Euro low-pass filter. Its
+cutoff rises during fast motion to reduce lag and falls during near-stationary
+periods to suppress network jitter. The COCO shoulder midpoint is used as a
+neck proxy and subtracted from every point, then coordinates are divided by
+the shoulder-to-hip midpoint distance (torso length). Smoothed original-frame
+pixel coordinates are retained for drawing.
 
-Keep the window at 5 for fast combinations. Try 7 when the camera or pose is
-visibly noisy, then regenerate diagnostics and recalibrate because velocity
-peak magnitudes will change.
+Detection runs on a selectable 480px or 640px square, aspect-preserving
+letterbox. ByteTrack locks one person ID. The corresponding rectangle is
+expanded by 10% on every side, clipped to the original frame, and then cut from
+the original pixels. That crop is letterboxed to the same selected scalar size,
+and only the padded crop is sent to YOLO11 pose.
 
 ## Punch-type parameters
 
@@ -128,8 +132,8 @@ accuracy. Camera viewpoint strongly affects image-plane trajectory rules.
 - `1.0` places it at shoulder height and is permissive;
 - `0.65` is the default.
 
-`Glove-cuff tolerance` shifts the line downward by a fraction of shoulder
-width. Increase it when the pose model places the wrist at the glove cuff even
+`Glove-cuff tolerance` shifts the line downward by a fraction of torso length.
+Increase it when the pose model places the wrist at the glove cuff even
 though the glove itself is protecting the face. The overall score is calculated
 across eligible hand-frame observations, so one temporarily unobservable or
 punching hand does not automatically fail the entire frame.

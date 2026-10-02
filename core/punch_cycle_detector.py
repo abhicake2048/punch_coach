@@ -75,17 +75,17 @@ class PunchDetector:
     def __init__(
         self,
         stance: str = "orthodox",
-        refractory_frames: int = 3,
+        refractory_frames: int = 9,
         max_refractory_frames: int = 12,
-        min_speed_threshold: float = 0.70,
-        min_extension_velocity: float = 0.25,
+        min_speed_threshold: float = 0.30,
+        min_extension_velocity: float = 0.10,
         retraction_velocity: float = 0.12,
-        min_extension_gain: float = 0.06,
-        min_retraction_gain: float = 0.04,
+        min_extension_gain: float = 0.04,
+        min_retraction_gain: float = 0.02,
         max_extension_gain: float = 1.40,
         max_extension_velocity: float = 25.0,
         min_outward_frames: int = 2,
-        min_count_angle: float = 45.0,
+        min_count_angle: float = 20.0,
         release_speed_ratio: float = 0.50,
         max_wrist_speed: float = 20.0,
         max_active_frames: int = 10,
@@ -296,8 +296,8 @@ class PunchDetector:
         )
         self.events.append(event)
         LOGGER.info(
-            "PUNCH time=%.3fs frame=%d hand=%s type=%s speed=%.3fSW/s "
-            "angle=%.1fdeg extension_gain=%.3fSW extension_peak=%.3fSW/s "
+            "PUNCH time=%.3fs frame=%d hand=%s type=%s speed=%.3fTL/s "
+            "angle=%.1fdeg extension_gain=%.3fTL extension_peak=%.3fTL/s "
             "outward_frames=%d",
             event.timestamp,
             event.frame_index,
@@ -404,13 +404,24 @@ class PunchDetector:
                     velocity_x=float(vector[0]),
                     velocity_y=float(vector[1]),
                 )
-            state.max_reach = float(np.nanmax([state.max_reach, reach]))
-            state.max_elbow_angle = float(
-                np.nanmax([state.max_elbow_angle, elbow_angle])
-            )
-            state.peak_extension_velocity = float(
-                np.nanmax([state.peak_extension_velocity, extension_velocity])
-            )
+            if np.isfinite(reach):
+                state.max_reach = (
+                    max(state.max_reach, reach)
+                    if np.isfinite(state.max_reach)
+                    else float(reach)
+                )
+            if np.isfinite(elbow_angle):
+                state.max_elbow_angle = (
+                    max(state.max_elbow_angle, elbow_angle)
+                    if np.isfinite(state.max_elbow_angle)
+                    else float(elbow_angle)
+                )
+            if np.isfinite(extension_velocity):
+                state.peak_extension_velocity = (
+                    max(state.peak_extension_velocity, extension_velocity)
+                    if np.isfinite(state.peak_extension_velocity)
+                    else float(extension_velocity)
+                )
 
         reversing = bool(
             finite_sample and extension_velocity <= -self.retraction_velocity

@@ -1,8 +1,10 @@
-"""Streamlit interface for CornerCoach milestone-1 pose inspection."""
+"""Streamlit interface for tracked top-down boxing analysis."""
 
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,6 +22,7 @@ from core.kinematics import (
 from core.fatigue_analyzer import FatigueAnalyzer, FatigueReport
 from core.guard_monitor import GuardMonitor
 from core.logging_config import configure_logging
+from core.boxer_pipeline import DEFAULT_INFERENCE_SIZE, TrackedBoxerPosePipeline
 from core.pose_engine import BOXING_KEYPOINT_INDICES, PoseEngine
 from core.punch_detector import PunchDetector
 from visualizer.video_annotator import draw_skeleton
@@ -33,8 +36,17 @@ LOGGER = logging.getLogger("cornercoach.app")
 
 @st.cache_resource(show_spinner=False)
 def load_pose_engine() -> PoseEngine:
-    """Create one cached CPU pose engine for the Streamlit process."""
-    return PoseEngine(weights="yolov8n-pose.pt", confidence_threshold=0.25)
+    """Create one cached YOLO11 pose engine for the Streamlit process."""
+    return PoseEngine(weights="yolo11s-pose.pt", confidence_threshold=0.25)
+
+
+@st.cache_resource(show_spinner=False)
+def load_vision_pipeline() -> TrackedBoxerPosePipeline:
+    """Create the cached detector/ByteTrack/top-down pose pipeline."""
+    return TrackedBoxerPosePipeline(
+        pose_engine=load_pose_engine(),
+        detector_weights="yolo11s-pose.pt",
+    )
 
 
 def _joint_angles(keypoints: dict[str, np.ndarray] | None) -> dict[str, float]:
@@ -81,7 +93,7 @@ def _keypoint_rows(keypoints: dict[str, np.ndarray] | None) -> list[dict[str, An
     return rows
 
 
-def process_image(uploaded_file: Any, engine: PoseEngine) -> None:
+def process_image(uploaded_file: Any, pipeline: TrackedBoxerPosePipeline) -> None:
     """Decode, analyze, and render one uploaded image."""
     image_bytes = np.frombuffer(uploaded_file.getvalue(), dtype=np.uint8)
     frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
@@ -89,7 +101,9 @@ def process_image(uploaded_file: Any, engine: PoseEngine) -> None:
         st.error("OpenCV could not decode this image.")
         return
 
-    raw_keypoints = engine.extract_keypoints(frame, imgsz=480)
+    pipeline.reset()
+    stages = pipeline.process(frame)
+    raw_keypoints = stages.raw_keypoints_original
     processed_pose = PoseSignalProcessor(window_length=5).update(raw_keypoints)
     pixel_keypoints = (
         processed_pose.pixel_keypoints if processed_pose is not None else None
@@ -125,13 +139,10 @@ def process_image(uploaded_file: Any, engine: PoseEngine) -> None:
         if processed_pose is None or keypoints is None:
             st.warning("No person was detected with sufficient confidence.")
         else:
-            st.metric(
-                "Shoulder scale",
-                _metric_text(processed_pose.shoulder_width_px, " px"),
-            )
+            st.metric("Torso scale", _metric_text(processed_pose.torso_length_px, " px"))
             st.caption(
-                "Displayed coordinates are Savitzky–Golay-smoothed pixels; "
-                "kinematics use shoulder-relative normalized coordinates."
+                "Displayed coordinates are One-Euro low-pass filtered; "
+                "kinematics are neck-centered and torso-length normalized."
             )
             st.dataframe(
                 _keypoint_rows(pixel_keypoints),
@@ -237,7 +248,7 @@ def _render_session_dashboard(
                     "Segment": "First third",
                     "Punches": fatigue_report.first_third_count,
                     "Work rate (PPM)": round(fatigue_report.first_work_rate_ppm, 1),
-                    "Mean peak speed (SW/s)": round(
+                    "Mean peak speed (TL/s)": round(
                         fatigue_report.first_average_speed, 2
                     ),
                 },
@@ -245,7 +256,7 @@ def _render_session_dashboard(
                     "Segment": "Last third",
                     "Punches": fatigue_report.last_third_count,
                     "Work rate (PPM)": round(fatigue_report.last_work_rate_ppm, 1),
-                    "Mean peak speed (SW/s)": round(
+                    "Mean peak speed (TL/s)": round(
                         fatigue_report.last_average_speed, 2
                     ),
                 },
@@ -264,28 +275,31 @@ def _analysis_settings_panel() -> dict[str, float | int]:
     """Expose count, classification, guard, and fatigue tuning controls."""
     with st.sidebar.expander("Punch count tuning", expanded=False):
         inference_size = st.select_slider(
-            "Pose inference size",
-            options=[320, 480, 640, 800],
-            value=480,
-            help="Larger values improve small/blurred wrist tracking but use more CPU.",
+            "YOLO input size (pixels)",
+            options=[480, 640],
+            value=DEFAULT_INFERENCE_SIZE,
+            help=(
+                "Both detector and pose use a square letterbox of this size. "
+                "Source pixels retain their original aspect ratio."
+            ),
         )
         min_speed = st.number_input(
-            "Minimum wrist speed (SW/s)", 0.1, 5.0, 0.7, 0.05
+            "Minimum wrist speed (torso lengths/s)", 0.1, 5.0, 0.3, 0.05
         )
         min_extension_speed = st.number_input(
-            "Minimum outward speed (SW/s)", 0.05, 5.0, 0.25, 0.05
+            "Minimum outward speed (torso lengths/s)", 0.05, 5.0, 0.10, 0.05
         )
         min_extension_gain = st.number_input(
-            "Minimum reach gain (shoulder widths)", 0.0, 0.5, 0.06, 0.005
+            "Minimum reach gain (torso lengths)", 0.0, 0.5, 0.04, 0.005
         )
         refractory_frames = st.number_input(
-            "Minimum same-hand cycle gap (frames)", 0, 12, 3, 1
+            "Minimum same-hand cycle gap (frames)", 0, 12, 9, 1
         )
         max_refractory_frames = st.number_input(
             "Maximum re-arm wait (frames)", 4, 30, 12, 1
         )
         min_retraction_gain = st.number_input(
-            "Partial retraction required (shoulder widths)", 0.0, 0.5, 0.04, 0.01
+            "Partial retraction required (torso lengths)", 0.0, 0.5, 0.02, 0.01
         )
         min_outward_frames = st.number_input(
             "Minimum outward-motion frames", 1, 6, 2, 1
@@ -297,16 +311,10 @@ def _analysis_settings_panel() -> dict[str, float | int]:
             "Maximum plausible outward speed", 1.0, 100.0, 25.0, 1.0
         )
         min_count_angle = st.number_input(
-            "Minimum cycle elbow angle", 0.0, 180.0, 45.0, 2.5
+            "Minimum cycle elbow angle", 0.0, 180.0, 20.0, 2.5
         )
         max_wrist_speed = st.number_input(
-            "Pose-jump rejection speed (SW/s)", 3.0, 100.0, 20.0, 1.0
-        )
-        savgol_window = st.select_slider(
-            "Savitzky–Golay window (frames)",
-            options=[5, 7],
-            value=5,
-            help="Polynomial order is fixed at 2; 7 frames is smoother but less responsive.",
+            "Pose-jump rejection speed (torso lengths/s)", 3.0, 100.0, 20.0, 1.0
         )
 
     with st.sidebar.expander("Punch type tuning", expanded=False):
@@ -334,7 +342,7 @@ def _analysis_settings_panel() -> dict[str, float | int]:
             "Guard line: nose → shoulder", 0.0, 1.0, 0.65, 0.05
         )
         guard_wrist_tolerance = st.slider(
-            "Glove-cuff tolerance (shoulder widths)", 0.0, 1.0, 0.15, 0.05
+            "Glove-cuff tolerance (torso lengths)", 0.0, 1.0, 0.15, 0.05
         )
         fatigue_work_rate_drop = st.slider(
             "Fatigue work-rate drop (%)", 0.0, 100.0, 20.0, 1.0
@@ -356,7 +364,6 @@ def _analysis_settings_panel() -> dict[str, float | int]:
         "max_extension_velocity": float(max_extension_velocity),
         "min_count_angle": float(min_count_angle),
         "max_wrist_speed": float(max_wrist_speed),
-        "savgol_window": int(savgol_window),
         "straight_min_angle": float(straight_min_angle),
         "hook_min_angle": float(hook_min_angle),
         "hook_max_angle": float(hook_max_angle),
@@ -370,13 +377,78 @@ def _analysis_settings_panel() -> dict[str, float | int]:
     }
 
 
+def _completed_analysis_key(
+    video_bytes: bytes,
+    filename: str,
+    stance: str,
+    settings: dict[str, float | int],
+) -> str:
+    """Build a stable key that changes only when input or analysis settings change."""
+    digest = hashlib.sha256()
+    digest.update(video_bytes)
+    digest.update(filename.encode("utf-8"))
+    digest.update(stance.encode("utf-8"))
+    digest.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _render_completed_video(result: dict[str, Any], reused: bool = False) -> None:
+    """Render a finished analysis without running either neural network again."""
+    st.success(
+        "Analysis complete — showing the saved result."
+        if reused
+        else "Analysis complete."
+    )
+    _render_session_dashboard(
+        result["punch_summary"],
+        result["guard_summary"],
+        result["fatigue_report"],
+    )
+    st.subheader("Final annotated video")
+    st.video(result["video_bytes"], format="video/mp4")
+    st.download_button(
+        "Download annotated MP4",
+        data=result["video_bytes"],
+        file_name=result["output_filename"],
+        mime="video/mp4",
+        key=f"download-video-{result['analysis_key']}",
+    )
+    st.caption(
+        "Wrist speed is normalized to torso lengths per second; missing pose "
+        "measurements are represented as chart gaps."
+    )
+    with st.expander("Parameters used for this analysis"):
+        st.json(result["settings"])
+    if LOG_PATH.exists():
+        st.download_button(
+            "Download analysis log",
+            data=LOG_PATH.read_bytes(),
+            file_name="cornercoach.log",
+            mime="text/plain",
+            key=f"download-log-{result['analysis_key']}",
+        )
+
+
 def process_video(
     uploaded_file: Any,
-    engine: PoseEngine,
+    pipeline: TrackedBoxerPosePipeline,
     stance: str = "orthodox",
     settings: dict[str, float | int] | None = None,
 ) -> None:
     """Analyze an uploaded video, showing live frames and an annotated result."""
+    active_settings = settings or _analysis_settings_panel()
+    source_bytes = uploaded_file.getvalue()
+    analysis_key = _completed_analysis_key(
+        source_bytes,
+        uploaded_file.name,
+        stance,
+        active_settings,
+    )
+    cached_result = st.session_state.get("completed_video_analysis")
+    if cached_result is not None and cached_result.get("analysis_key") == analysis_key:
+        _render_completed_video(cached_result, reused=True)
+        return
+
     input_suffix = Path(uploaded_file.name).suffix.lower()
     input_path: Path | None = None
     intermediate_path: Path | None = None
@@ -386,7 +458,7 @@ def process_video(
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as source:
-            source.write(uploaded_file.getbuffer())
+            source.write(source_bytes)
             input_path = Path(source.name)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".avi") as intermediate:
             intermediate_path = Path(intermediate.name)
@@ -419,7 +491,6 @@ def process_video(
             st.error("OpenCV could not initialize the intermediate video writer.")
             return
 
-        active_settings = settings or _analysis_settings_panel()
         punch_detector = PunchDetector(
             stance=stance,
             refractory_frames=int(active_settings["refractory_frames"]),
@@ -448,11 +519,9 @@ def process_video(
             work_rate_drop_threshold=float(active_settings["fatigue_work_rate_drop"]),
             speed_drop_threshold=float(active_settings["fatigue_speed_drop"]),
         )
-        signal_processor = PoseSignalProcessor(
-            window_length=int(active_settings["savgol_window"]),
-            polynomial_order=2,
-        )
+        signal_processor = PoseSignalProcessor(sample_frequency=fps)
         motion_tracker = WristMotionTracker()
+        pipeline.reset()
         LOGGER.info(
             "VIDEO_START file=%s fps=%.3f frames=%d dimensions=%dx%d stance=%s settings=%s",
             uploaded_file.name,
@@ -464,7 +533,16 @@ def process_video(
             active_settings,
         )
 
-        st.subheader("Live analysis")
+        st.subheader("Live pipeline inspection")
+        st.caption(
+            "Preprocess → YOLO11 + ByteTrack → exact boxer crop → cropped YOLO11 pose → final analytics"
+        )
+        stage_columns = st.columns(4)
+        preprocess_placeholder = stage_columns[0].empty()
+        detection_placeholder = stage_columns[1].empty()
+        crop_placeholder = stage_columns[2].empty()
+        pose_placeholder = stage_columns[3].empty()
+        st.subheader("Final annotated output")
         frame_placeholder = st.empty()
         left_angle_card, right_angle_card, left_speed_card, right_speed_card = st.columns(4)
         angle_chart_column, speed_chart_column = st.columns(2)
@@ -483,10 +561,13 @@ def process_video(
             if not ok:
                 break
 
-            raw_keypoints = engine.extract_keypoints(
-                frame, imgsz=int(active_settings["inference_size"])
+            stages = pipeline.process(
+                frame,
+                inference_size=int(active_settings["inference_size"]),
             )
-            processed_pose = signal_processor.update(raw_keypoints)
+            raw_keypoints = stages.raw_keypoints_original
+            elapsed = frame_index / fps
+            processed_pose = signal_processor.update(raw_keypoints, timestamp=elapsed)
             pixel_keypoints = (
                 processed_pose.pixel_keypoints
                 if processed_pose is not None
@@ -523,7 +604,6 @@ def process_video(
                 wrist_reaches[side] = motion.reach
                 extension_velocities[side] = motion.extension_velocity
 
-            elapsed = frame_index / fps
             frame_events = []
             for side in ("left", "right"):
                 event = punch_detector.update(
@@ -559,7 +639,7 @@ def process_video(
             live_punch_summary = punch_detector.summary(max(elapsed, dt))
 
             annotated = draw_skeleton(
-                frame,
+                stages.detection_frame,
                 pixel_keypoints,
                 elbow_angles=angles,
                 wrist_speeds=wrist_speeds,
@@ -601,6 +681,53 @@ def process_video(
                 )
 
             if frame_index == 1 or frame_index % 5 == 0:
+                preprocess_placeholder.image(
+                    cv2.cvtColor(stages.preprocessed_frame, cv2.COLOR_BGR2RGB),
+                    caption=(
+                        f"1 · {active_settings['inference_size']}px square letterbox"
+                    ),
+                    channels="RGB",
+                    use_container_width=True,
+                )
+                detection_placeholder.image(
+                    cv2.cvtColor(stages.detection_frame, cv2.COLOR_BGR2RGB),
+                    caption=(
+                        f"2 · Boxer ID {stages.tracked_box.track_id}"
+                        if stages.tracked_box is not None
+                        else "2 · Awaiting tracked boxer"
+                    ),
+                    channels="RGB",
+                    use_container_width=True,
+                )
+                crop_display = (
+                    stages.crop_frame
+                    if stages.crop_frame is not None
+                    else np.zeros(
+                        (
+                            int(active_settings["inference_size"]),
+                            int(active_settings["inference_size"]),
+                            3,
+                        ),
+                        dtype=np.uint8,
+                    )
+                )
+                crop_placeholder.image(
+                    cv2.cvtColor(crop_display, cv2.COLOR_BGR2RGB),
+                    caption="3 · Original-frame crop + 10% padding",
+                    channels="RGB",
+                    use_container_width=True,
+                )
+                pose_display = (
+                    stages.pose_crop_frame
+                    if stages.pose_crop_frame is not None
+                    else crop_display
+                )
+                pose_placeholder.image(
+                    cv2.cvtColor(pose_display, cv2.COLOR_BGR2RGB),
+                    caption="4 · YOLO11 pose on crop only",
+                    channels="RGB",
+                    use_container_width=True,
+                )
                 frame_placeholder.image(
                     cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                     channels="RGB",
@@ -613,10 +740,10 @@ def process_video(
                     "Right elbow", _metric_text(angles["right"], "°")
                 )
                 left_speed_card.metric(
-                    "Left wrist", _metric_text(wrist_speeds["left"], " SW/s")
+                    "Left wrist", _metric_text(wrist_speeds["left"], " TL/s")
                 )
                 right_speed_card.metric(
-                    "Right wrist", _metric_text(wrist_speeds["right"], " SW/s")
+                    "Right wrist", _metric_text(wrist_speeds["right"], " TL/s")
                 )
                 angle_chart_placeholder.line_chart(
                     angle_history,
@@ -628,7 +755,7 @@ def process_video(
                     speed_history,
                     x="Time (s)",
                     y=["Left wrist", "Right wrist"],
-                    y_label="Speed (shoulder widths/second)",
+                    y_label="Speed (torso lengths/second)",
                 )
 
             if total_frames > 0:
@@ -657,28 +784,21 @@ def process_video(
         _transcode_browser_mp4(intermediate_path, output_path)
         progress.progress(1.0, text=f"Finished {frame_index:,} frames")
 
-        video_bytes = output_path.read_bytes()
-        st.subheader("Annotated video")
-        st.video(video_bytes, format="video/mp4")
-        st.download_button(
-            "Download annotated MP4",
-            data=video_bytes,
-            file_name=f"{Path(uploaded_file.name).stem}_cornercoach.mp4",
-            mime="video/mp4",
-        )
-
         duration_seconds = frame_index / fps
         punch_summary = punch_detector.summary(duration_seconds)
         guard_summary = guard_monitor.summary()
         fatigue_report = fatigue_analyzer.analyze(duration_seconds)
-        _render_session_dashboard(punch_summary, guard_summary, fatigue_report)
-
-        st.caption(
-            "Wrist speed is normalized to shoulder widths per second; missing pose "
-            "measurements are represented as chart gaps."
-        )
-        with st.expander("Parameters used for this analysis"):
-            st.json(active_settings)
+        completed_result = {
+            "analysis_key": analysis_key,
+            "video_bytes": output_path.read_bytes(),
+            "output_filename": f"{Path(uploaded_file.name).stem}_cornercoach.mp4",
+            "punch_summary": punch_summary,
+            "guard_summary": guard_summary,
+            "fatigue_report": fatigue_report,
+            "settings": active_settings,
+        }
+        st.session_state["completed_video_analysis"] = completed_result
+        _render_completed_video(completed_result)
         LOGGER.info(
             "VIDEO_SUMMARY file=%s duration=%.3fs total_punches=%d ppm=%.2f "
             "by_type=%s by_hand=%s guard_score=%.2f%% guard_drops=%s "
@@ -696,13 +816,6 @@ def process_video(
             fatigue_report.speed_drop_percent,
         )
 
-        if LOG_PATH.exists():
-            st.download_button(
-                "Download analysis log",
-                data=LOG_PATH.read_bytes(),
-                file_name="cornercoach.log",
-                mime="text/plain",
-            )
     finally:
         if capture is not None:
             capture.release()
@@ -735,11 +848,11 @@ def main() -> None:
 
     try:
         with st.spinner(
-            "Loading YOLOv8n-pose on CPU (the first run may download the weights)…"
+            "Loading YOLO11 detector, ByteTrack, and YOLO11 pose on CPU…"
         ):
-            engine = load_pose_engine()
+            pipeline = load_vision_pipeline()
         if suffix in IMAGE_EXTENSIONS:
-            process_image(uploaded_file, engine)
+            process_image(uploaded_file, pipeline)
         else:
             stance = st.sidebar.selectbox(
                 "Fighter stance",
@@ -750,7 +863,7 @@ def main() -> None:
             settings = _analysis_settings_panel()
             process_video(
                 uploaded_file,
-                engine,
+                pipeline,
                 stance=stance.lower(),
                 settings=settings,
             )

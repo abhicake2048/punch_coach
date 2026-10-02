@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy.signal import savgol_filter
 
 
 def _xy(point: ArrayLike) -> NDArray[np.float64]:
@@ -123,11 +121,78 @@ def compute_wrist_metrics(
 
 @dataclass(frozen=True)
 class ProcessedPose:
-    """One pose represented in smoothed pixels and normalized coordinates."""
+    """One pose represented in smoothed pixels and torso-normalized coordinates."""
 
     pixel_keypoints: dict[str, NDArray[np.float64]]
     normalized_keypoints: dict[str, NDArray[np.float64]] | None
-    shoulder_width_px: float
+    torso_length_px: float
+    origin_name: str
+
+    @property
+    def shoulder_width_px(self) -> float:
+        """Backward-compatible alias for older UI code (now torso scale)."""
+        return self.torso_length_px
+
+
+def normalize_keypoints_by_torso(
+    keypoints: Mapping[str, ArrayLike],
+    min_confidence: float = 0.25,
+) -> tuple[dict[str, NDArray[np.float64]] | None, float, str]:
+    """Center on the neck proxy (or hips) and divide by torso length.
+
+    COCO does not expose a neck joint, so the shoulder midpoint is used as the
+    neck proxy.  Torso length is the distance between shoulder and hip
+    midpoints.  When hips are temporarily unavailable, shoulder width is a
+    stable scale fallback; when shoulders are unavailable, the hip midpoint is
+    used as the origin and the last usable scale must be supplied by temporal
+    processing.
+    """
+    left_shoulder = keypoints.get("left_shoulder")
+    right_shoulder = keypoints.get("right_shoulder")
+    left_hip = keypoints.get("left_hip")
+    right_hip = keypoints.get("right_hip")
+    shoulders_valid = _valid_keypoint(left_shoulder, min_confidence) and _valid_keypoint(
+        right_shoulder, min_confidence
+    )
+    hips_valid = _valid_keypoint(left_hip, min_confidence) and _valid_keypoint(
+        right_hip, min_confidence
+    )
+    if not shoulders_valid and not hips_valid:
+        return None, float("nan"), "unavailable"
+
+    neck = (
+        (_xy(left_shoulder) + _xy(right_shoulder)) / 2.0
+        if shoulders_valid
+        else None
+    )
+    hip_center = (
+        (_xy(left_hip) + _xy(right_hip)) / 2.0 if hips_valid else None
+    )
+    origin = neck if neck is not None else hip_center
+    origin_name = "neck" if neck is not None else "hip"
+    assert origin is not None
+
+    if neck is not None and hip_center is not None:
+        torso_length = float(np.linalg.norm(hip_center - neck))
+    elif shoulders_valid:
+        torso_length = float(np.linalg.norm(_xy(left_shoulder) - _xy(right_shoulder)))
+    else:
+        torso_length = float("nan")
+    if not np.isfinite(torso_length) or torso_length <= 1e-12:
+        return None, float("nan"), origin_name
+
+    normalized: dict[str, NDArray[np.float64]] = {}
+    for name, raw_point in keypoints.items():
+        point = np.asarray(raw_point, dtype=np.float64).reshape(-1)
+        confidence = float(point[2]) if point.size >= 3 else 1.0
+        if point.size < 2 or not np.all(np.isfinite(point[:2])):
+            normalized[name] = np.array([np.nan, np.nan, confidence], dtype=np.float64)
+            continue
+        normalized_xy = (point[:2] - origin) / torso_length
+        normalized[name] = np.array(
+            [normalized_xy[0], normalized_xy[1], confidence], dtype=np.float64
+        )
+    return normalized, torso_length, origin_name
 
 
 def normalize_keypoints_by_shoulders(
@@ -173,12 +238,11 @@ def normalize_keypoints_by_shoulders(
 
 
 class PoseSignalProcessor:
-    """Smooth raw keypoints, then produce shoulder-relative coordinates.
+    """One-Euro low-pass keypoints, then produce torso-relative coordinates.
 
-    A trailing Savitzky-Golay window avoids adding display latency while still
-    fitting a local second-order trajectory. During the first few frames the
-    oldest available sample is edge-padded, so all coordinates pass through
-    the same configured filter before kinematics are calculated.
+    The One-Euro filter raises its cutoff during rapid movement.  It strongly
+    suppresses stationary network jitter while retaining punch transients with
+    substantially less phase lag than a fixed moving-window filter.
     """
 
     def __init__(
@@ -186,6 +250,10 @@ class PoseSignalProcessor:
         window_length: int = 5,
         polynomial_order: int = 2,
         min_confidence: float = 0.25,
+        sample_frequency: float = 30.0,
+        min_cutoff: float = 1.7,
+        beta: float = 0.30,
+        derivative_cutoff: float = 1.0,
     ) -> None:
         """Configure the rolling filter and shoulder confidence threshold."""
         if window_length not in {5, 7}:
@@ -194,16 +262,24 @@ class PoseSignalProcessor:
             raise ValueError("polynomial_order must be below window_length")
         if not 0.0 <= min_confidence <= 1.0:
             raise ValueError("min_confidence must be between 0 and 1")
+        if sample_frequency <= 0.0 or min_cutoff <= 0.0 or derivative_cutoff <= 0.0:
+            raise ValueError("filter frequencies must be positive")
+        if beta < 0.0:
+            raise ValueError("beta cannot be negative")
         self.window_length = int(window_length)
         self.polynomial_order = int(polynomial_order)
         self.min_confidence = float(min_confidence)
-        self._history: deque[dict[str, NDArray[np.float64]] | None] = deque(
-            maxlen=self.window_length
-        )
+        self.sample_frequency = float(sample_frequency)
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.derivative_cutoff = float(derivative_cutoff)
+        self._states: dict[str, tuple[NDArray[np.float64], NDArray[np.float64], float]] = {}
+        self._implicit_timestamp = 0.0
 
     def reset(self) -> None:
         """Discard temporal history after a seek or stream discontinuity."""
-        self._history.clear()
+        self._states.clear()
+        self._implicit_timestamp = 0.0
 
     @staticmethod
     def _copy_pose(
@@ -217,69 +293,48 @@ class PoseSignalProcessor:
         }
 
     @staticmethod
-    def _fill_missing(values: NDArray[np.float64]) -> NDArray[np.float64] | None:
-        """Interpolate internal gaps and hold the nearest valid edge sample."""
-        valid = np.flatnonzero(np.isfinite(values))
-        if valid.size == 0:
-            return None
-        indices = np.arange(values.size, dtype=np.float64)
-        return np.interp(indices, valid.astype(np.float64), values[valid])
+    def _alpha(cutoff: NDArray[np.float64] | float, dt: float) -> NDArray[np.float64]:
+        time_constant = 1.0 / (2.0 * np.pi * np.asarray(cutoff, dtype=np.float64))
+        return 1.0 / (1.0 + time_constant / dt)
 
-    def _smooth_xy(
+    def _smooth_point(
         self,
-        current: Mapping[str, NDArray[np.float64]],
-    ) -> dict[str, NDArray[np.float64]]:
-        """Filter all x/y series in one vectorized SciPy call."""
-        names = tuple(current)
-        values = np.full(
-            (len(self._history), len(names), 2),
-            np.nan,
-            dtype=np.float64,
-        )
-        for frame_index, pose in enumerate(self._history):
-            if pose is None:
-                continue
-            for point_index, name in enumerate(names):
-                point = pose.get(name)
-                if point is not None and point.size >= 2:
-                    values[frame_index, point_index] = point[:2]
-
-        for point_index in range(len(names)):
-            for axis in range(2):
-                filled = self._fill_missing(values[:, point_index, axis])
-                values[:, point_index, axis] = (
-                    filled if filled is not None else 0.0
-                )
-
-        if values.shape[0] < self.window_length:
-            values = np.pad(
-                values,
-                ((self.window_length - values.shape[0], 0), (0, 0), (0, 0)),
-                mode="edge",
-            )
-        filtered = savgol_filter(
-            values,
-            window_length=self.window_length,
-            polyorder=self.polynomial_order,
-            axis=0,
-            mode="interp",
-        )
-        return {
-            name: filtered[-1, point_index].copy()
-            for point_index, name in enumerate(names)
-        }
+        name: str,
+        value: NDArray[np.float64],
+        timestamp: float,
+    ) -> NDArray[np.float64]:
+        state = self._states.get(name)
+        if state is None:
+            filtered = value.copy()
+            derivative = np.zeros(2, dtype=np.float64)
+        else:
+            previous, previous_derivative, previous_timestamp = state
+            dt = timestamp - previous_timestamp
+            if not np.isfinite(dt) or dt <= 0.0:
+                dt = 1.0 / self.sample_frequency
+            raw_derivative = (value - previous) / dt
+            derivative_alpha = self._alpha(self.derivative_cutoff, dt)
+            derivative = derivative_alpha * raw_derivative + (1.0 - derivative_alpha) * previous_derivative
+            cutoff = self.min_cutoff + self.beta * np.abs(derivative)
+            signal_alpha = self._alpha(cutoff, dt)
+            filtered = signal_alpha * value + (1.0 - signal_alpha) * previous
+        self._states[name] = (filtered.copy(), derivative.copy(), float(timestamp))
+        return filtered
 
     def update(
         self,
         keypoints: Mapping[str, ArrayLike] | None,
+        timestamp: float | None = None,
     ) -> ProcessedPose | None:
         """Filter one raw pose and return pixel plus normalized coordinates."""
         current = self._copy_pose(keypoints)
-        self._history.append(current)
         if current is None:
             return None
-
-        filtered_xy = self._smooth_xy(current)
+        if timestamp is None:
+            timestamp = self._implicit_timestamp
+            self._implicit_timestamp += 1.0 / self.sample_frequency
+        if not np.isfinite(timestamp):
+            raise ValueError("timestamp must be finite")
         smoothed: dict[str, NDArray[np.float64]] = {}
         for name, point in current.items():
             confidence = float(point[2]) if point.size >= 3 else 1.0
@@ -293,23 +348,25 @@ class PoseSignalProcessor:
                     [np.nan, np.nan, confidence], dtype=np.float64
                 )
                 continue
+            filtered_xy = self._smooth_point(name, point[:2], float(timestamp))
             smoothed[name] = np.array(
                 [
-                    filtered_xy[name][0],
-                    filtered_xy[name][1],
+                    filtered_xy[0],
+                    filtered_xy[1],
                     confidence,
                 ],
                 dtype=np.float64,
             )
 
-        normalized, shoulder_width = normalize_keypoints_by_shoulders(
+        normalized, torso_length, origin_name = normalize_keypoints_by_torso(
             smoothed,
             min_confidence=self.min_confidence,
         )
         return ProcessedPose(
             pixel_keypoints=smoothed,
             normalized_keypoints=normalized,
-            shoulder_width_px=shoulder_width,
+            torso_length_px=torso_length,
+            origin_name=origin_name,
         )
 
 
@@ -334,7 +391,7 @@ class ArmMotion:
 
 
 class WristMotionTracker:
-    """Differentiate Savitzky-Golay-smoothed, shoulder-normalized wrists."""
+    """Differentiate One-Euro-smoothed, torso-normalized wrists."""
 
     def __init__(self) -> None:
         """Create independent motion histories for the left and right hands."""
