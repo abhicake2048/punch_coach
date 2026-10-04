@@ -69,10 +69,17 @@ The setup scripts stop with a clear error if a required checkpoint is missing.
 
 ## Recommended CPU settings
 
-The app defaults to the faster configuration:
+The app always preserves the training-time top-down preprocessing order:
 
-- `Fast single-pass YOLO pose`: enabled. YOLO11s performs tracking and pose in
-  one inference instead of running the pose network a second time on the crop.
+- YOLO11s first detects and tracks the primary person in the full frame.
+- The tracked person box is expanded by 10% on every side.
+- The padded boxer crop is letterboxed without stretching.
+- A separate YOLO11s pose model extracts keypoints from that crop.
+- Crop keypoints are mapped back into original-frame coordinates before pose
+  smoothing, kinematics, and LSTM/ST-GCN inference.
+
+The CPU-safe runtime optimizations are:
+
 - `YOLO input size`: 480 pixels.
 - `Live diagnostic preview`: disabled. Every video frame is still analyzed and
   written to the final annotated video; Streamlit simply avoids expensive image
@@ -89,10 +96,9 @@ $env:CORNERCOACH_CPU_THREADS = "4"
 ```
 
 Measure speed on the actual production computer. More threads are not always
-faster. If the tracked boxer is small or the single-pass pose quality is
-insufficient, disable `Fast single-pass YOLO pose` in the sidebar. That restores
-the original two-stage detector -> padded crop -> pose path, but it is expected
-to be substantially slower.
+faster. The detector -> 10% padded crop -> pose sequence cannot be disabled in
+the production interface because the existing checkpoints were trained from
+features extracted with this top-down approach.
 
 The application does not skip inference frames because the trained checkpoints
 use 11-frame motion sequences and fast punches may last only 5-8 frames.
@@ -114,8 +120,8 @@ Streamlit download button.
 
 ## Models and decision rules
 
-- `weights/yolo11s-pose.pt`: single-pass person tracking and pose, or optional
-  two-stage tracking plus cropped pose.
+- `weights/yolo11s-pose.pt`: mandatory full-frame person tracking followed by
+  cropped top-down pose extraction.
 - `weights/lstm/best_checkpoint.pt`: 11-frame LSTM inference.
 - `weights/stgcn/best_checkpoint.pt`: 11-frame ST-GCN inference.
 
@@ -131,11 +137,9 @@ and recovery gates also pass. Predictions below the threshold remain `IDLE`.
   Required production files and rerun setup.
 - **Gemini report button is disabled:** pass `-GeminiApiKey` to `run.ps1`, set
   `GEMINI_API_KEY`, or place it in Streamlit secrets.
-- **CPU inference is still slow:** keep 480 pixels, single-pass pose enabled, and
-  live preview disabled. Test `CORNERCOACH_CPU_THREADS` values 2, 4, and 8 on the
-  target machine.
-- **Pose quality drops in fast mode:** turn off single-pass pose for that video.
-  This is a quality/speed tradeoff; it does not change the trained classifier.
+- **CPU inference is still slow:** keep 480 pixels and live preview disabled.
+  Test `CORNERCOACH_CPU_THREADS` values 2, 4, and 8 on the target machine. The
+  top-down crop/pose stage remains mandatory for checkpoint compatibility.
 
 Runtime logs are written under `logs/`. Training code and historical utilities
 remain under `Extras/` and are not needed to launch the app.

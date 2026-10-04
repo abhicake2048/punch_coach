@@ -43,7 +43,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLO_WEIGHTS = PROJECT_ROOT / "weights" / "yolo11s-pose.pt"
-ANALYSIS_SCHEMA_VERSION = "single-pass-cpu-pdf-v2"
+ANALYSIS_SCHEMA_VERSION = "top-down-cpu-pdf-v3"
 LOG_PATH = configure_logging()
 LOGGER = logging.getLogger("cornercoach.app")
 
@@ -75,12 +75,11 @@ def load_pose_engine() -> PoseEngine:
 
 
 @st.cache_resource(show_spinner=False)
-def load_vision_pipeline(single_pass_pose: bool = True) -> TrackedBoxerPosePipeline:
-    """Create the cached detector/ByteTrack/top-down pose pipeline."""
+def load_vision_pipeline() -> TrackedBoxerPosePipeline:
+    """Create the mandatory detector/ByteTrack/top-down pose pipeline."""
     return TrackedBoxerPosePipeline(
         pose_engine=load_pose_engine(),
         detector_weights=YOLO_WEIGHTS,
-        single_pass_pose=single_pass_pose,
     )
 
 
@@ -354,15 +353,6 @@ def _analysis_settings_panel(model_kind: str) -> dict[str, Any]:
     """Expose selected-model recognition, guard, and fatigue controls."""
     model_label = "LSTM" if model_kind == "lstm" else "ST-GCN"
     with st.sidebar.expander(f"YOLO + {model_label} recognition", expanded=False):
-        single_pass_pose = st.toggle(
-            "Fast single-pass YOLO pose",
-            value=True,
-            help=(
-                "Recommended for CPU. Reuses the tracked YOLO11 pose result and "
-                "removes the second cropped-pose inference. Disable it to use the "
-                "original two-stage detector-plus-crop pipeline."
-            ),
-        )
         inference_size = st.select_slider(
             "YOLO input size (pixels)",
             options=[480, 640],
@@ -464,7 +454,6 @@ def _analysis_settings_panel(model_kind: str) -> dict[str, Any]:
 
     return {
         "model_kind": model_kind,
-        "single_pass_pose": bool(single_pass_pose),
         "inference_size": int(inference_size),
         "model_confidence": float(model_confidence),
         "keypoint_confidence": float(keypoint_confidence),
@@ -792,8 +781,9 @@ def process_video(
             hand_chart_placeholder = hand_chart_column.empty()
         else:
             st.info(
-                "Fast CPU mode is processing every frame without redrawing the live "
-                "diagnostic dashboard. The final video and analytics will still appear."
+                "Every frame is being processed by the top-down pipeline without "
+                "redrawing the live diagnostic dashboard. The final video and "
+                "analytics will still appear."
             )
         progress = st.progress(
             0.0,
@@ -1099,7 +1089,7 @@ def main() -> None:
     try:
         if suffix in IMAGE_EXTENSIONS:
             with st.spinner("Loading YOLO11 and ByteTrack…"):
-                pipeline = load_vision_pipeline(single_pass_pose=True)
+                pipeline = load_vision_pipeline()
             process_image(uploaded_file, pipeline)
         else:
             selected_model = st.radio(
@@ -1128,15 +1118,8 @@ def main() -> None:
                     "positives; review the annotated video before using the report."
                 )
             settings = _analysis_settings_panel(model_kind)
-            pipeline_mode = (
-                "single-pass CPU"
-                if settings["single_pass_pose"]
-                else "two-stage compatibility"
-            )
-            with st.spinner(f"Loading YOLO11 ({pipeline_mode} mode)…"):
-                pipeline = load_vision_pipeline(
-                    single_pass_pose=bool(settings["single_pass_pose"])
-                )
+            with st.spinner("Loading YOLO11 top-down pose pipeline…"):
+                pipeline = load_vision_pipeline()
             process_video(
                 uploaded_file,
                 pipeline,
