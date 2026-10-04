@@ -49,76 +49,6 @@ def _valid_keypoint(point: ArrayLike | None, min_confidence: float) -> bool:
     return array.size < 3 or bool(np.isfinite(array[2]) and array[2] >= min_confidence)
 
 
-def calculate_torso_scale(
-    keypoints: Mapping[str, ArrayLike],
-    min_confidence: float = 0.25,
-) -> float:
-    """Return torso length for scale-invariant motion measurements.
-
-    Torso length is the distance from the midpoint of the shoulders to the
-    midpoint of the hips. If either hip is unavailable, shoulder width is used
-    as the fallback. ``NaN`` is returned when a reliable scale cannot be formed.
-    """
-    left_shoulder = keypoints.get("left_shoulder")
-    right_shoulder = keypoints.get("right_shoulder")
-    if not (
-        _valid_keypoint(left_shoulder, min_confidence)
-        and _valid_keypoint(right_shoulder, min_confidence)
-    ):
-        return float("nan")
-
-    left_shoulder_xy = _xy(left_shoulder)
-    right_shoulder_xy = _xy(right_shoulder)
-    shoulder_width = float(np.linalg.norm(left_shoulder_xy - right_shoulder_xy))
-
-    left_hip = keypoints.get("left_hip")
-    right_hip = keypoints.get("right_hip")
-    if _valid_keypoint(left_hip, min_confidence) and _valid_keypoint(
-        right_hip, min_confidence
-    ):
-        mid_shoulder = (left_shoulder_xy + right_shoulder_xy) / 2.0
-        mid_hip = (_xy(left_hip) + _xy(right_hip)) / 2.0
-        torso_length = float(np.linalg.norm(mid_hip - mid_shoulder))
-        if np.isfinite(torso_length) and torso_length > 1e-12:
-            return torso_length
-
-    if np.isfinite(shoulder_width) and shoulder_width > 1e-12:
-        return shoulder_width
-    return float("nan")
-
-
-def compute_wrist_metrics(
-    prev_wrist: ArrayLike,
-    curr_wrist: ArrayLike,
-    torso_scale: float,
-    dt: float,
-) -> tuple[NDArray[np.float64], float]:
-    """Calculate normalized wrist velocity and scalar speed.
-
-    Returns:
-        A tuple ``(velocity, speed)`` where velocity is ``[vx, vy]`` and speed
-        is its Euclidean magnitude. Units are torso lengths per second.
-
-    Invalid coordinates, non-positive time deltas, or unusable torso scales
-    produce ``NaN`` values rather than misleading motion estimates.
-    """
-    if dt <= 0.0 or not np.isfinite(dt):
-        return np.full(2, np.nan, dtype=np.float64), float("nan")
-    if torso_scale <= 1e-12 or not np.isfinite(torso_scale):
-        return np.full(2, np.nan, dtype=np.float64), float("nan")
-
-    previous = _xy(prev_wrist)
-    current = _xy(curr_wrist)
-    if previous.shape != current.shape or previous.shape != (2,):
-        raise ValueError("wrist inputs must each represent one x/y point")
-    if not np.all(np.isfinite(previous)) or not np.all(np.isfinite(current)):
-        return np.full(2, np.nan, dtype=np.float64), float("nan")
-
-    normalized_velocity = (current - previous) / (float(torso_scale) * float(dt))
-    speed = float(np.linalg.norm(normalized_velocity))
-    return normalized_velocity, speed
-
-
 @dataclass(frozen=True)
 class ProcessedPose:
     """One pose represented in smoothed pixels and torso-normalized coordinates."""
@@ -127,12 +57,6 @@ class ProcessedPose:
     normalized_keypoints: dict[str, NDArray[np.float64]] | None
     torso_length_px: float
     origin_name: str
-
-    @property
-    def shoulder_width_px(self) -> float:
-        """Backward-compatible alias for older UI code (now torso scale)."""
-        return self.torso_length_px
-
 
 def normalize_keypoints_by_torso(
     keypoints: Mapping[str, ArrayLike],
@@ -193,48 +117,6 @@ def normalize_keypoints_by_torso(
             [normalized_xy[0], normalized_xy[1], confidence], dtype=np.float64
         )
     return normalized, torso_length, origin_name
-
-
-def normalize_keypoints_by_shoulders(
-    keypoints: Mapping[str, ArrayLike],
-    min_confidence: float = 0.25,
-) -> tuple[dict[str, NDArray[np.float64]] | None, float]:
-    """Center a pose on the shoulder midpoint and divide by shoulder width.
-
-    The returned coordinates are translation- and scale-invariant: the
-    shoulder midpoint is ``(0, 0)`` and the distance between shoulders is one.
-    Confidence values are preserved. ``(None, NaN)`` is returned when either
-    shoulder is unavailable or their separation is degenerate.
-    """
-    left = keypoints.get("left_shoulder")
-    right = keypoints.get("right_shoulder")
-    if not (
-        _valid_keypoint(left, min_confidence)
-        and _valid_keypoint(right, min_confidence)
-    ):
-        return None, float("nan")
-
-    left_xy = _xy(left)
-    right_xy = _xy(right)
-    midpoint = (left_xy + right_xy) / 2.0
-    shoulder_width = float(np.linalg.norm(left_xy - right_xy))
-    if not np.isfinite(shoulder_width) or shoulder_width <= 1e-12:
-        return None, float("nan")
-
-    normalized: dict[str, NDArray[np.float64]] = {}
-    for name, raw_point in keypoints.items():
-        point = np.asarray(raw_point, dtype=np.float64).reshape(-1)
-        confidence = float(point[2]) if point.size >= 3 else 1.0
-        if point.size < 2 or not np.all(np.isfinite(point[:2])):
-            normalized[name] = np.array(
-                [np.nan, np.nan, confidence], dtype=np.float64
-            )
-            continue
-        normalized_xy = (point[:2] - midpoint) / shoulder_width
-        normalized[name] = np.array(
-            [normalized_xy[0], normalized_xy[1], confidence], dtype=np.float64
-        )
-    return normalized, shoulder_width
 
 
 class PoseSignalProcessor:
@@ -367,99 +249,4 @@ class PoseSignalProcessor:
             normalized_keypoints=normalized,
             torso_length_px=torso_length,
             origin_name=origin_name,
-        )
-
-
-@dataclass(frozen=True)
-class ArmMotion:
-    """Smoothed shoulder-relative wrist motion for one frame."""
-
-    velocity: NDArray[np.float64]
-    speed: float
-    reach: float
-    extension_velocity: float
-
-    @classmethod
-    def missing(cls) -> "ArmMotion":
-        """Return an explicitly invalid sample for an occluded arm."""
-        return cls(
-            velocity=np.full(2, np.nan, dtype=np.float64),
-            speed=float("nan"),
-            reach=float("nan"),
-            extension_velocity=float("nan"),
-        )
-
-
-class WristMotionTracker:
-    """Differentiate One-Euro-smoothed, torso-normalized wrists."""
-
-    def __init__(self) -> None:
-        """Create independent motion histories for the left and right hands."""
-        self._positions: dict[str, NDArray[np.float64] | None] = {
-            "left": None,
-            "right": None,
-        }
-        self._reaches: dict[str, float | None] = {"left": None, "right": None}
-
-    def reset(self, hand: str | None = None) -> None:
-        """Reset one hand or both hands after an occlusion/discontinuity."""
-        hands = (hand,) if hand is not None else ("left", "right")
-        for selected_hand in hands:
-            if selected_hand not in self._positions:
-                raise ValueError("hand must be 'left' or 'right'")
-            self._positions[selected_hand] = None
-            self._reaches[selected_hand] = None
-
-    def update(
-        self,
-        hand: str,
-        wrist: ArrayLike | None,
-        shoulder: ArrayLike | None,
-        dt: float,
-    ) -> ArmMotion:
-        """Return velocity and reach in shoulder-widths per second."""
-        if hand not in self._positions:
-            raise ValueError("hand must be 'left' or 'right'")
-        if (
-            wrist is None
-            or shoulder is None
-            or not np.isfinite(dt)
-            or dt <= 0.0
-        ):
-            self.reset(hand)
-            return ArmMotion.missing()
-
-        wrist_xy = _xy(wrist)
-        shoulder_xy = _xy(shoulder)
-        if (
-            wrist_xy.shape != (2,)
-            or shoulder_xy.shape != (2,)
-            or not np.all(np.isfinite(wrist_xy))
-            or not np.all(np.isfinite(shoulder_xy))
-        ):
-            self.reset(hand)
-            return ArmMotion.missing()
-
-        previous_position = self._positions[hand]
-        reach = float(np.linalg.norm(wrist_xy - shoulder_xy))
-        if previous_position is None:
-            self._positions[hand] = wrist_xy.copy()
-            self._reaches[hand] = reach
-            return ArmMotion.missing()
-
-        velocity = (wrist_xy - previous_position) / float(dt)
-        speed = float(np.linalg.norm(velocity))
-        previous_reach = self._reaches[hand]
-        extension_velocity = (
-            (reach - previous_reach) / float(dt)
-            if previous_reach is not None
-            else float("nan")
-        )
-        self._positions[hand] = wrist_xy.copy()
-        self._reaches[hand] = reach
-        return ArmMotion(
-            velocity=velocity,
-            speed=speed,
-            reach=reach,
-            extension_velocity=extension_velocity,
         )

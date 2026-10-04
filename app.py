@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,39 +14,84 @@ from typing import Any
 import cv2
 import numpy as np
 import streamlit as st
+import torch
 
 from core.kinematics import (
     PoseSignalProcessor,
-    WristMotionTracker,
     calculate_angle,
+)
+from core.coaching_report import (
+    DEFAULT_GEMINI_MODEL,
+    build_coaching_metrics,
+    evidence_for_point,
+    generate_coaching_report,
 )
 from core.fatigue_analyzer import FatigueAnalyzer, FatigueReport
 from core.guard_monitor import GuardMonitor
 from core.logging_config import configure_logging
-from core.boxer_pipeline import DEFAULT_INFERENCE_SIZE, TrackedBoxerPosePipeline
+from core.boxer_pipeline import TrackedBoxerPosePipeline
 from core.pose_engine import BOXING_KEYPOINT_INDICES, PoseEngine
-from core.punch_detector import PunchDetector
+from core.pdf_report import create_coaching_pdf
+from core.trained_punch_recognizer import (
+    MINIMUM_PUNCH_CONFIDENCE,
+    TrainedPunchRecognizer,
+)
 from visualizer.video_annotator import draw_skeleton
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
+PROJECT_ROOT = Path(__file__).resolve().parent
+YOLO_WEIGHTS = PROJECT_ROOT / "weights" / "yolo11s-pose.pt"
+ANALYSIS_SCHEMA_VERSION = "single-pass-cpu-pdf-v2"
 LOG_PATH = configure_logging()
 LOGGER = logging.getLogger("cornercoach.app")
 
 
 @st.cache_resource(show_spinner=False)
-def load_pose_engine() -> PoseEngine:
-    """Create one cached YOLO11 pose engine for the Streamlit process."""
-    return PoseEngine(weights="yolo11s-pose.pt", confidence_threshold=0.25)
+def configure_cpu_runtime() -> int:
+    """Avoid OpenCV/Torch thread oversubscription during CPU inference."""
+    available = max(1, int(os.cpu_count() or 1))
+    requested = os.getenv("CORNERCOACH_CPU_THREADS", "").strip()
+    try:
+        thread_count = int(requested) if requested else min(8, available)
+    except ValueError:
+        thread_count = min(8, available)
+    thread_count = max(1, min(thread_count, available))
+    cv2.setNumThreads(1)
+    torch.set_num_threads(thread_count)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch allows this setting only before inter-op work starts.
+        pass
+    return thread_count
 
 
 @st.cache_resource(show_spinner=False)
-def load_vision_pipeline() -> TrackedBoxerPosePipeline:
+def load_pose_engine() -> PoseEngine:
+    """Create one cached YOLO11 pose engine for the Streamlit process."""
+    return PoseEngine(weights=YOLO_WEIGHTS, confidence_threshold=0.25)
+
+
+@st.cache_resource(show_spinner=False)
+def load_vision_pipeline(single_pass_pose: bool = True) -> TrackedBoxerPosePipeline:
     """Create the cached detector/ByteTrack/top-down pose pipeline."""
     return TrackedBoxerPosePipeline(
         pose_engine=load_pose_engine(),
-        detector_weights="yolo11s-pose.pt",
+        detector_weights=YOLO_WEIGHTS,
+        single_pass_pose=single_pass_pose,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def load_trained_recognizer(model_kind: str) -> TrainedPunchRecognizer:
+    """Load the user-selected multi-task punch checkpoint once."""
+    normalized_kind = model_kind.strip().lower()
+    return TrainedPunchRecognizer(
+        checkpoint_path=PROJECT_ROOT / "weights" / normalized_kind / "best_checkpoint.pt",
+        model_kind=normalized_kind,
+        device="auto",
     )
 
 
@@ -151,16 +197,6 @@ def process_image(uploaded_file: Any, pipeline: TrackedBoxerPosePipeline) -> Non
             )
 
 
-def _valid_xy(keypoints: dict[str, np.ndarray] | None, name: str) -> np.ndarray | None:
-    """Return a copy of a finite x/y keypoint or None."""
-    if keypoints is None or name not in keypoints:
-        return None
-    point = np.asarray(keypoints[name], dtype=np.float64)
-    if point.size < 2 or not np.all(np.isfinite(point[:2])):
-        return None
-    return point[:2].copy()
-
-
 def _transcode_browser_mp4(source_path: Path, output_path: Path) -> None:
     """Transcode an OpenCV intermediate into browser-compatible H.264 MP4."""
     try:
@@ -226,8 +262,26 @@ def _render_session_dashboard(
         "Fatigue indicator", "Drop detected" if fatigue_report.fatigued else "Stable"
     )
 
+    hand_counts = dict(punch_summary.get("by_hand", {}))
+    left_column, right_column = st.columns(2)
+    left_column.metric("Left-hand punches", int(hand_counts.get("left", 0)))
+    right_column.metric("Right-hand punches", int(hand_counts.get("right", 0)))
+
     statistics_column, fatigue_details_column = st.columns(2)
     with statistics_column:
+        st.markdown("**Punch counts by type**")
+        type_counts = dict(punch_summary.get("by_type", {}))
+        if type_counts:
+            st.dataframe(
+                [
+                    {"Punch type": label, "Count": count}
+                    for label, count in sorted(type_counts.items())
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("No punches met the classification thresholds.")
         st.markdown("**Punch counts by hand and type**")
         combined_counts = punch_summary["by_type_and_hand"]
         count_rows = [
@@ -238,7 +292,6 @@ def _render_session_dashboard(
             st.dataframe(count_rows, hide_index=True, use_container_width=True)
         else:
             st.info("No punches met the classification thresholds.")
-
     with fatigue_details_column:
         st.markdown("**Fatigue comparison**")
         st.write(fatigue_report.message)
@@ -265,76 +318,134 @@ def _render_session_dashboard(
             use_container_width=True,
         )
 
+    st.markdown("**Non-punching-hand guard drops**")
+    guard_events = list(guard_summary.get("events", []))
+    if guard_events:
+        st.dataframe(
+            [
+                {
+                    "Hand": str(event["hand"]).title(),
+                    "Start (s)": round(float(event["start_time_s"]), 2),
+                    "End (s)": round(float(event["end_time_s"]), 2),
+                    "Duration (s)": round(float(event["duration_s"]), 2),
+                    "Deepest level": str(event["deepest_level"])
+                    .removeprefix("below_")
+                    .replace("_", " ")
+                    .title(),
+                }
+                for event in guard_events
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+    elif int(guard_summary.get("eligible_frames", 0)) > 0:
+        st.success("No guard-drop episodes were recorded on eligible frames.")
+    else:
+        st.info("Guard position could not be evaluated from the available pose data.")
+
     st.caption(
-        "Punch classification and fatigue are image-plane heuristics intended "
-        "for coaching review, not instrument-grade measurements."
+        f"Punch type and hand were predicted by the selected "
+        f"{punch_summary.get('model_display_name', 'trained')} checkpoint using "
+        f"{punch_summary.get('sequence_length', 'its saved')} frame windows."
     )
 
 
-def _analysis_settings_panel() -> dict[str, float | int]:
-    """Expose count, classification, guard, and fatigue tuning controls."""
-    with st.sidebar.expander("Punch count tuning", expanded=False):
+def _analysis_settings_panel(model_kind: str) -> dict[str, Any]:
+    """Expose selected-model recognition, guard, and fatigue controls."""
+    model_label = "LSTM" if model_kind == "lstm" else "ST-GCN"
+    with st.sidebar.expander(f"YOLO + {model_label} recognition", expanded=False):
+        single_pass_pose = st.toggle(
+            "Fast single-pass YOLO pose",
+            value=True,
+            help=(
+                "Recommended for CPU. Reuses the tracked YOLO11 pose result and "
+                "removes the second cropped-pose inference. Disable it to use the "
+                "original two-stage detector-plus-crop pipeline."
+            ),
+        )
         inference_size = st.select_slider(
             "YOLO input size (pixels)",
             options=[480, 640],
-            value=DEFAULT_INFERENCE_SIZE,
+            value=480,
             help=(
                 "Both detector and pose use a square letterbox of this size. "
                 "Source pixels retain their original aspect ratio."
             ),
         )
-        min_speed = st.number_input(
-            "Minimum wrist speed (torso lengths/s)", 0.1, 5.0, 0.3, 0.05
+        model_confidence = st.slider(
+            "Punch confidence threshold",
+            MINIMUM_PUNCH_CONFIDENCE,
+            0.99,
+            MINIMUM_PUNCH_CONFIDENCE,
+            0.01,
+            help=(
+                f"A punch is registered only above {MINIMUM_PUNCH_CONFIDENCE * 100:.0f}%. "
+                "Predictions at or below "
+                "the selected threshold are treated as IDLE."
+            ),
         )
-        min_extension_speed = st.number_input(
-            "Minimum outward speed (torso lengths/s)", 0.05, 5.0, 0.10, 0.05
+        keypoint_confidence = st.slider(
+            "Pose keypoint confidence",
+            0.10,
+            0.90,
+            0.25,
+            0.05,
+            help="The training extraction used 0.25.",
         )
-        min_extension_gain = st.number_input(
-            "Minimum reach gain (torso lengths)", 0.0, 0.5, 0.04, 0.005
+        recovery_frames = st.number_input(
+            "Minimum peak spacing (frames)",
+            0,
+            120,
+            8,
+            1,
+            help="Prevents adjacent samples from the same neural peak being counted twice.",
         )
-        refractory_frames = st.number_input(
-            "Minimum same-hand cycle gap (frames)", 0, 12, 9, 1
+        peak_prominence = st.slider(
+            "Model/motion peak prominence",
+            0.0,
+            0.50,
+            0.04,
+            0.01,
+            help="Required activation drop before one punch peak is counted.",
         )
-        max_refractory_frames = st.number_input(
-            "Maximum re-arm wait (frames)", 4, 30, 12, 1
+        minimum_wrist_speed = st.slider(
+            "Minimum wrist speed (torso lengths/s)",
+            0.0,
+            3.0,
+            0.20,
+            0.05,
+            help="Motion gate that reduces idle false positives from the small dataset.",
         )
-        min_retraction_gain = st.number_input(
-            "Partial retraction required (torso lengths)", 0.0, 0.5, 0.02, 0.01
+        minimum_extension_velocity = st.slider(
+            "Minimum outward wrist extension (torso lengths/s)",
+            0.0,
+            2.0,
+            0.05,
+            0.05,
+            help="Rejects retractions and idle wrist motion before counting a punch.",
         )
-        min_outward_frames = st.number_input(
-            "Minimum outward-motion frames", 1, 6, 2, 1
+        minimum_pose_coverage = st.slider(
+            "Minimum valid pose coverage",
+            0.50,
+            1.00,
+            0.80,
+            0.05,
+            help="Matches the minimum sequence coverage used during dataset construction.",
         )
-        max_extension_gain = st.number_input(
-            "Maximum plausible reach gain", 0.1, 3.0, 1.40, 0.05
+        live_preview = st.toggle(
+            "Live diagnostic preview",
+            value=False,
+            help=(
+                "Disabled by default for faster CPU processing. The final annotated "
+                "video and complete report are still produced."
+            ),
         )
-        max_extension_velocity = st.number_input(
-            "Maximum plausible outward speed", 1.0, 100.0, 25.0, 1.0
-        )
-        min_count_angle = st.number_input(
-            "Minimum cycle elbow angle", 0.0, 180.0, 20.0, 2.5
-        )
-        max_wrist_speed = st.number_input(
-            "Pose-jump rejection speed (torso lengths/s)", 3.0, 100.0, 20.0, 1.0
-        )
-
-    with st.sidebar.expander("Punch type tuning", expanded=False):
-        straight_min_angle = st.number_input(
-            "Jab/Cross minimum extension angle", 90.0, 180.0, 140.0, 2.0
-        )
-        hook_min_angle = st.number_input(
-            "Hook minimum elbow angle", 30.0, 150.0, 75.0, 2.0
-        )
-        hook_max_angle = st.number_input(
-            "Hook maximum elbow angle", 60.0, 180.0, 130.0, 2.0
-        )
-        hook_horizontal_ratio = st.slider(
-            "Hook horizontal-motion ratio", 0.0, 1.0, 0.62, 0.02
-        )
-        uppercut_max_angle = st.number_input(
-            "Uppercut maximum elbow angle", 30.0, 180.0, 115.0, 2.0
-        )
-        uppercut_upward_ratio = st.slider(
-            "Uppercut upward-motion ratio", 0.0, 1.0, 0.45, 0.02
+        preview_interval = st.select_slider(
+            "Preview refresh interval (frames)",
+            options=[5, 10, 15, 30],
+            value=15,
+            disabled=not live_preview,
+            help="A larger interval reduces Streamlit rendering overhead.",
         )
 
     with st.sidebar.expander("Guard and fatigue tuning", expanded=False):
@@ -352,24 +463,18 @@ def _analysis_settings_panel() -> dict[str, float | int]:
         )
 
     return {
+        "model_kind": model_kind,
+        "single_pass_pose": bool(single_pass_pose),
         "inference_size": int(inference_size),
-        "min_speed": float(min_speed),
-        "min_extension_speed": float(min_extension_speed),
-        "min_extension_gain": float(min_extension_gain),
-        "refractory_frames": int(refractory_frames),
-        "max_refractory_frames": int(max_refractory_frames),
-        "min_retraction_gain": float(min_retraction_gain),
-        "min_outward_frames": int(min_outward_frames),
-        "max_extension_gain": float(max_extension_gain),
-        "max_extension_velocity": float(max_extension_velocity),
-        "min_count_angle": float(min_count_angle),
-        "max_wrist_speed": float(max_wrist_speed),
-        "straight_min_angle": float(straight_min_angle),
-        "hook_min_angle": float(hook_min_angle),
-        "hook_max_angle": float(hook_max_angle),
-        "hook_horizontal_ratio": float(hook_horizontal_ratio),
-        "uppercut_max_angle": float(uppercut_max_angle),
-        "uppercut_upward_ratio": float(uppercut_upward_ratio),
+        "model_confidence": float(model_confidence),
+        "keypoint_confidence": float(keypoint_confidence),
+        "recovery_frames": int(recovery_frames),
+        "peak_prominence": float(peak_prominence),
+        "minimum_wrist_speed": float(minimum_wrist_speed),
+        "minimum_extension_velocity": float(minimum_extension_velocity),
+        "minimum_pose_coverage": float(minimum_pose_coverage),
+        "live_preview": bool(live_preview),
+        "preview_interval": int(preview_interval),
         "guard_chin_fraction": float(guard_chin_fraction),
         "guard_wrist_tolerance": float(guard_wrist_tolerance),
         "fatigue_work_rate_drop": float(fatigue_work_rate_drop),
@@ -380,16 +485,159 @@ def _analysis_settings_panel() -> dict[str, float | int]:
 def _completed_analysis_key(
     video_bytes: bytes,
     filename: str,
-    stance: str,
-    settings: dict[str, float | int],
+    settings: dict[str, Any],
 ) -> str:
     """Build a stable key that changes only when input or analysis settings change."""
     digest = hashlib.sha256()
+    digest.update(ANALYSIS_SCHEMA_VERSION.encode("utf-8"))
     digest.update(video_bytes)
     digest.update(filename.encode("utf-8"))
-    digest.update(stance.encode("utf-8"))
     digest.update(json.dumps(settings, sort_keys=True).encode("utf-8"))
     return digest.hexdigest()
+
+
+def _configured_gemini_api_key() -> str:
+    """Read a server-side Gemini key without exposing it in session settings."""
+    environment_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if environment_key:
+        return environment_key
+    try:
+        return str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
+def _render_coaching_report(result: dict[str, Any]) -> None:
+    """Generate and render an optional metric-grounded Gemini report."""
+    st.subheader("Gemini coaching report")
+    st.caption(
+        "Only the structured punch, guard, and fatigue metrics shown above are "
+        "sent to Gemini. The video and pose frames are never sent."
+    )
+    configured_key = _configured_gemini_api_key()
+    api_key_input = st.text_input(
+        "Gemini API key",
+        type="password",
+        value="",
+        placeholder=(
+            "Using configured GEMINI_API_KEY"
+            if configured_key
+            else "Paste your Gemini API key"
+        ),
+        key=f"gemini-key-{result['analysis_key']}",
+        help=(
+            "The key is used only for this API request and is not stored in the "
+            "analysis result or written to logs. You can instead configure the "
+            "GEMINI_API_KEY environment variable or Streamlit secret."
+        ),
+    )
+    model_name = st.text_input(
+        "Gemini model",
+        value=DEFAULT_GEMINI_MODEL,
+        key=f"gemini-model-{result['analysis_key']}",
+    ).strip()
+    effective_key = api_key_input.strip() or configured_key
+    metrics = build_coaching_metrics(
+        result["punch_summary"],
+        result["guard_summary"],
+        result["fatigue_report"],
+        float(result.get("duration_seconds", 0.0)),
+    )
+    if st.button(
+        "Generate coaching report",
+        type="primary",
+        disabled=not bool(effective_key and model_name),
+        key=f"generate-report-{result['analysis_key']}",
+    ):
+        try:
+            with st.spinner("Generating a grounded coaching report with Gemini…"):
+                report = generate_coaching_report(
+                    metrics,
+                    api_key=effective_key,
+                    model=model_name,
+                )
+            st.session_state["gemini_coaching_report"] = {
+                "analysis_key": result["analysis_key"],
+                "model": model_name,
+                "report": report,
+            }
+        except Exception as exc:
+            LOGGER.exception(
+                "COACHING_REPORT_FAILED analysis=%s model=%s",
+                result["analysis_key"],
+                model_name,
+            )
+            st.error(f"Gemini coaching report failed: {exc}")
+
+    cached = st.session_state.get("gemini_coaching_report")
+    if not isinstance(cached, dict):
+        if not effective_key:
+            st.info("Enter a Gemini API key to enable report generation.")
+        return
+    if (
+        cached.get("analysis_key") != result["analysis_key"]
+        or cached.get("model") != model_name
+    ):
+        return
+    report = cached.get("report")
+    if not isinstance(report, dict):
+        return
+
+    st.write(report["summary"])
+    sections = (
+        ("Three strengths", "strengths"),
+        ("Three areas to improve", "areas_to_improve"),
+        ("Two suggested drills", "suggested_drills"),
+    )
+    for heading, key in sections:
+        st.markdown(f"**{heading}**")
+        for index, point in enumerate(report[key], start=1):
+            st.markdown(f"{index}. **{point['title']}** — {point['comment']}")
+            evidence = evidence_for_point(point, metrics)
+            if evidence:
+                evidence_text = ", ".join(
+                    f"`{name}` = {value}" for name, value in evidence.items()
+                )
+                st.caption(f"Measured evidence: {evidence_text}")
+    limitations = report.get("data_limitations", [])
+    if limitations:
+        with st.expander("Data limitations"):
+            for limitation in limitations:
+                st.write(f"- {limitation}")
+
+    pdf_digest = hashlib.sha256(
+        (
+            result["analysis_key"]
+            + model_name
+            + json.dumps(report, sort_keys=True, separators=(",", ":"))
+        ).encode("utf-8")
+    ).hexdigest()
+    cached_pdf = st.session_state.get("coaching_report_pdf")
+    if not isinstance(cached_pdf, dict) or cached_pdf.get("key") != pdf_digest:
+        try:
+            cached_pdf = {
+                "key": pdf_digest,
+                "bytes": create_coaching_pdf(
+                    metrics,
+                    report,
+                    source_filename=str(result.get("source_filename", "Uploaded video")),
+                ),
+            }
+            st.session_state["coaching_report_pdf"] = cached_pdf
+        except Exception as exc:
+            LOGGER.exception("PDF_REPORT_FAILED analysis=%s", result["analysis_key"])
+            st.error(f"PDF report creation failed: {exc}")
+            return
+
+    source_stem = Path(str(result.get("source_filename", "boxing_session"))).stem
+    st.download_button(
+        "Download coaching report PDF",
+        data=cached_pdf["bytes"],
+        file_name=f"{source_stem}_cornercoach_report.pdf",
+        mime="application/pdf",
+        key=f"download-pdf-{pdf_digest}",
+        type="primary",
+    )
 
 
 def _render_completed_video(result: dict[str, Any], reused: bool = False) -> None:
@@ -404,6 +652,7 @@ def _render_completed_video(result: dict[str, Any], reused: bool = False) -> Non
         result["guard_summary"],
         result["fatigue_report"],
     )
+    _render_coaching_report(result)
     st.subheader("Final annotated video")
     st.video(result["video_bytes"], format="video/mp4")
     st.download_button(
@@ -432,16 +681,15 @@ def _render_completed_video(result: dict[str, Any], reused: bool = False) -> Non
 def process_video(
     uploaded_file: Any,
     pipeline: TrackedBoxerPosePipeline,
-    stance: str = "orthodox",
-    settings: dict[str, float | int] | None = None,
+    recognizer: TrainedPunchRecognizer,
+    settings: dict[str, Any] | None = None,
 ) -> None:
     """Analyze an uploaded video, showing live frames and an annotated result."""
-    active_settings = settings or _analysis_settings_panel()
+    active_settings = settings or _analysis_settings_panel(recognizer.model_kind)
     source_bytes = uploaded_file.getvalue()
     analysis_key = _completed_analysis_key(
         source_bytes,
         uploaded_file.name,
-        stance,
         active_settings,
     )
     cached_result = st.session_state.get("completed_video_analysis")
@@ -491,26 +739,19 @@ def process_video(
             st.error("OpenCV could not initialize the intermediate video writer.")
             return
 
-        punch_detector = PunchDetector(
-            stance=stance,
-            refractory_frames=int(active_settings["refractory_frames"]),
-            max_refractory_frames=int(active_settings["max_refractory_frames"]),
-            min_speed_threshold=float(active_settings["min_speed"]),
-            min_extension_velocity=float(active_settings["min_extension_speed"]),
-            min_extension_gain=float(active_settings["min_extension_gain"]),
-            min_retraction_gain=float(active_settings["min_retraction_gain"]),
-            min_outward_frames=int(active_settings["min_outward_frames"]),
-            max_extension_gain=float(active_settings["max_extension_gain"]),
-            max_extension_velocity=float(active_settings["max_extension_velocity"]),
-            min_count_angle=float(active_settings["min_count_angle"]),
-            max_wrist_speed=float(active_settings["max_wrist_speed"]),
-            straight_min_angle=float(active_settings["straight_min_angle"]),
-            hook_min_angle=float(active_settings["hook_min_angle"]),
-            hook_max_angle=float(active_settings["hook_max_angle"]),
-            hook_horizontal_ratio=float(active_settings["hook_horizontal_ratio"]),
-            uppercut_max_angle=float(active_settings["uppercut_max_angle"]),
-            uppercut_upward_ratio=float(active_settings["uppercut_upward_ratio"]),
+        recognizer.confidence_threshold = max(
+            MINIMUM_PUNCH_CONFIDENCE,
+            float(active_settings["model_confidence"]),
         )
+        recognizer.keypoint_confidence = float(active_settings["keypoint_confidence"])
+        recognizer.recovery_frames = int(active_settings["recovery_frames"])
+        recognizer.peak_prominence = float(active_settings["peak_prominence"])
+        recognizer.minimum_wrist_speed = float(active_settings["minimum_wrist_speed"])
+        recognizer.minimum_extension_velocity = float(
+            active_settings["minimum_extension_velocity"]
+        )
+        recognizer.minimum_pose_coverage = float(active_settings["minimum_pose_coverage"])
+        recognizer.reset(fps=fps)
         guard_monitor = GuardMonitor(
             chin_fraction=float(active_settings["guard_chin_fraction"]),
             wrist_tolerance=float(active_settings["guard_wrist_tolerance"]),
@@ -520,38 +761,47 @@ def process_video(
             speed_drop_threshold=float(active_settings["fatigue_speed_drop"]),
         )
         signal_processor = PoseSignalProcessor(sample_frequency=fps)
-        motion_tracker = WristMotionTracker()
         pipeline.reset()
         LOGGER.info(
-            "VIDEO_START file=%s fps=%.3f frames=%d dimensions=%dx%d stance=%s settings=%s",
+            "VIDEO_START file=%s fps=%.3f frames=%d dimensions=%dx%d settings=%s",
             uploaded_file.name,
             fps,
             total_frames,
             width,
             height,
-            stance,
             active_settings,
         )
 
-        st.subheader("Live pipeline inspection")
-        st.caption(
-            "Preprocess → YOLO11 + ByteTrack → exact boxer crop → cropped YOLO11 pose → final analytics"
+        live_preview = bool(active_settings.get("live_preview", False))
+        preview_interval = int(active_settings.get("preview_interval", 15))
+        if live_preview:
+            st.subheader("Live pipeline inspection")
+            st.caption(
+                "Preprocess -> YOLO11 + ByteTrack -> boxer crop -> pose -> final analytics"
+            )
+            stage_columns = st.columns(4)
+            preprocess_placeholder = stage_columns[0].empty()
+            detection_placeholder = stage_columns[1].empty()
+            crop_placeholder = stage_columns[2].empty()
+            pose_placeholder = stage_columns[3].empty()
+            st.subheader("Final annotated output")
+            frame_placeholder = st.empty()
+            count_card, action_card, punch_conf_card, hand_conf_card = st.columns(4)
+            punch_chart_column, hand_chart_column = st.columns(2)
+            punch_chart_placeholder = punch_chart_column.empty()
+            hand_chart_placeholder = hand_chart_column.empty()
+        else:
+            st.info(
+                "Fast CPU mode is processing every frame without redrawing the live "
+                "diagnostic dashboard. The final video and analytics will still appear."
+            )
+        progress = st.progress(
+            0.0,
+            text=f"Processing video with {recognizer.display_name}…",
         )
-        stage_columns = st.columns(4)
-        preprocess_placeholder = stage_columns[0].empty()
-        detection_placeholder = stage_columns[1].empty()
-        crop_placeholder = stage_columns[2].empty()
-        pose_placeholder = stage_columns[3].empty()
-        st.subheader("Final annotated output")
-        frame_placeholder = st.empty()
-        left_angle_card, right_angle_card, left_speed_card, right_speed_card = st.columns(4)
-        angle_chart_column, speed_chart_column = st.columns(2)
-        angle_chart_placeholder = angle_chart_column.empty()
-        speed_chart_placeholder = speed_chart_column.empty()
-        progress = st.progress(0.0, text="Processing video on CPU…")
 
-        angle_history: list[dict[str, float]] = []
-        speed_history: list[dict[str, float]] = []
+        punch_score_history: list[dict[str, float]] = []
+        hand_score_history: list[dict[str, float]] = []
         frame_index = 0
         flash_label: str | None = None
         flash_until = -1.0
@@ -578,56 +828,32 @@ def process_video(
                 if processed_pose is not None
                 else None
             )
-            angles = _joint_angles(keypoints)
-            wrist_speeds = {"left": float("nan"), "right": float("nan")}
-            wrist_velocities = {
-                "left": np.full(2, np.nan, dtype=np.float64),
-                "right": np.full(2, np.nan, dtype=np.float64),
-            }
-            wrist_reaches = {"left": float("nan"), "right": float("nan")}
-            extension_velocities = {
-                "left": float("nan"),
-                "right": float("nan"),
-            }
-
-            for side in ("left", "right"):
-                current_wrist = _valid_xy(keypoints, f"{side}_wrist")
-                current_shoulder = _valid_xy(keypoints, f"{side}_shoulder")
-                motion = motion_tracker.update(
-                    side,
-                    current_wrist,
-                    current_shoulder,
-                    dt,
-                )
-                wrist_velocities[side] = motion.velocity
-                wrist_speeds[side] = motion.speed
-                wrist_reaches[side] = motion.reach
-                extension_velocities[side] = motion.extension_velocity
-
-            frame_events = []
-            for side in ("left", "right"):
-                event = punch_detector.update(
-                    hand=side,
-                    velocity=wrist_velocities[side],
-                    speed=wrist_speeds[side],
-                    elbow_angle=angles[side],
-                    timestamp=elapsed,
-                    frame_index=frame_index,
-                    reach=wrist_reaches[side],
-                    extension_velocity=extension_velocities[side],
-                )
-                if event is not None:
-                    frame_events.append(event)
+            frame_events = recognizer.update(
+                pixel_keypoints,
+                timestamp=elapsed,
+                frame_index=frame_index,
+            )
+            for event in frame_events:
+                if event.action_kind == "punch":
                     fatigue_analyzer.add_punch(event)
 
             if frame_events:
-                flash_label = " / ".join(event.label for event in frame_events)
+                flash_label = " / ".join(
+                    f"{event.action_kind.upper()}: {event.label}"
+                    for event in frame_events
+                )
                 flash_until = elapsed + 0.45
             elif elapsed > flash_until:
                 flash_label = None
 
+            classification_label = flash_label or recognizer.current_label
+
+            current_punching_hand = recognizer.current_punching_hand
             punch_active = {
-                side: punch_detector.is_punch_active(side)
+                side: (
+                    recognizer.is_punch_active(side)
+                    or current_punching_hand == side
+                )
                 for side in ("left", "right")
             }
             guard_status = guard_monitor.update(
@@ -636,38 +862,23 @@ def process_video(
                 punch_active=punch_active,
             )
 
-            live_punch_summary = punch_detector.summary(max(elapsed, dt))
+            live_punch_summary = recognizer.summary(max(elapsed, dt))
 
             annotated = draw_skeleton(
                 stages.detection_frame,
                 pixel_keypoints,
-                elbow_angles=angles,
-                wrist_speeds=wrist_speeds,
-                punch_label=flash_label,
+                punch_label=classification_label,
                 guard_warning=guard_status.warning,
                 session_stats={
                     "Punches": live_punch_summary["total_punches"],
                     "Left": dict(live_punch_summary["by_hand"]).get("left", 0),
                     "Right": dict(live_punch_summary["by_hand"]).get("right", 0),
+                    "Model": recognizer.display_name,
                     "Guard": f"{guard_monitor.discipline_score:.0f}%",
                 },
             )
             writer.write(annotated)
 
-            angle_history.append(
-                {
-                    "Time (s)": elapsed,
-                    "Left elbow": angles["left"],
-                    "Right elbow": angles["right"],
-                }
-            )
-            speed_history.append(
-                {
-                    "Time (s)": elapsed,
-                    "Left wrist": wrist_speeds["left"],
-                    "Right wrist": wrist_speeds["right"],
-                }
-            )
             frame_index += 1
 
             if frame_index % 300 == 0:
@@ -676,11 +887,27 @@ def process_video(
                     uploaded_file.name,
                     frame_index,
                     elapsed,
-                    len(punch_detector.events),
+                    len(recognizer.events),
                     guard_monitor.discipline_score,
                 )
 
-            if frame_index == 1 or frame_index % 5 == 0:
+            if live_preview and (
+                frame_index == 1 or frame_index % preview_interval == 0
+            ):
+                punch_score_history.append({
+                    "Time (s)": elapsed,
+                    **{
+                        name.title(): score
+                        for name, score in recognizer.latest_scores.punch_type.items()
+                    },
+                })
+                hand_score_history.append({
+                    "Time (s)": elapsed,
+                    **{
+                        name.title(): score
+                        for name, score in recognizer.latest_scores.hand.items()
+                    },
+                })
                 preprocess_placeholder.image(
                     cv2.cvtColor(stages.preprocessed_frame, cv2.COLOR_BGR2RGB),
                     caption=(
@@ -733,37 +960,53 @@ def process_video(
                     channels="RGB",
                     use_container_width=True,
                 )
-                left_angle_card.metric(
-                    "Left elbow", _metric_text(angles["left"], "°")
+                punch_scores = recognizer.latest_scores.punch_type
+                hand_scores = recognizer.latest_scores.hand
+                best_punch = max(punch_scores, key=punch_scores.get)
+                best_hand = max(hand_scores, key=hand_scores.get)
+                count_card.metric(
+                    f"{recognizer.display_name} punch count",
+                    live_punch_summary["total_punches"],
                 )
-                right_angle_card.metric(
-                    "Right elbow", _metric_text(angles["right"], "°")
+                action_card.metric("Latest classification", classification_label)
+                if recognizer.current_label == "IDLE" and flash_label is None:
+                    punch_conf_card.metric(
+                        "Punch confidence",
+                        f"{recognizer.current_confidence * 100:.1f}% · IDLE",
+                    )
+                else:
+                    punch_conf_card.metric(
+                        best_punch.title(),
+                        f"{punch_scores[best_punch] * 100:.1f}%",
+                    )
+                hand_conf_card.metric(
+                    f"Hand: {best_hand.title()}",
+                    f"{hand_scores[best_hand] * 100:.1f}%",
                 )
-                left_speed_card.metric(
-                    "Left wrist", _metric_text(wrist_speeds["left"], " TL/s")
-                )
-                right_speed_card.metric(
-                    "Right wrist", _metric_text(wrist_speeds["right"], " TL/s")
-                )
-                angle_chart_placeholder.line_chart(
-                    angle_history,
+                punch_chart_placeholder.line_chart(
+                    punch_score_history,
                     x="Time (s)",
-                    y=["Left elbow", "Right elbow"],
-                    y_label="Elbow angle (degrees)",
+                    y=[name.title() for name in recognizer.punch_classes],
+                    y_label=f"{recognizer.display_name} punch probability",
                 )
-                speed_chart_placeholder.line_chart(
-                    speed_history,
+                hand_chart_placeholder.line_chart(
+                    hand_score_history,
                     x="Time (s)",
-                    y=["Left wrist", "Right wrist"],
-                    y_label="Speed (torso lengths/second)",
+                    y=[name.title() for name in recognizer.hand_classes],
+                    y_label=f"{recognizer.display_name} hand probability",
                 )
 
-            if total_frames > 0:
+            should_update_progress = (
+                frame_index == 1
+                or frame_index % 30 == 0
+                or (total_frames > 0 and frame_index >= total_frames)
+            )
+            if total_frames > 0 and should_update_progress:
                 progress.progress(
                     min(frame_index / total_frames, 1.0),
                     text=f"Processed {frame_index:,} / {total_frames:,} frames",
                 )
-            else:
+            elif total_frames <= 0 and should_update_progress:
                 progress.progress(
                     0.0,
                     text=f"Processed {frame_index:,} frames",
@@ -773,8 +1016,8 @@ def process_video(
             st.error("The video did not contain any readable frames.")
             return
 
-        for event in punch_detector.flush():
-            fatigue_analyzer.add_punch(event)
+        for final_event in recognizer.flush():
+            fatigue_analyzer.add_punch(final_event)
 
         capture.release()
         capture = None
@@ -785,16 +1028,19 @@ def process_video(
         progress.progress(1.0, text=f"Finished {frame_index:,} frames")
 
         duration_seconds = frame_index / fps
-        punch_summary = punch_detector.summary(duration_seconds)
+        punch_summary = recognizer.summary(duration_seconds)
+        guard_monitor.finalize(duration_seconds)
         guard_summary = guard_monitor.summary()
         fatigue_report = fatigue_analyzer.analyze(duration_seconds)
         completed_result = {
             "analysis_key": analysis_key,
+            "source_filename": uploaded_file.name,
             "video_bytes": output_path.read_bytes(),
             "output_filename": f"{Path(uploaded_file.name).stem}_cornercoach.mp4",
             "punch_summary": punch_summary,
             "guard_summary": guard_summary,
             "fatigue_report": fatigue_report,
+            "duration_seconds": duration_seconds,
             "settings": active_settings,
         }
         st.session_state["completed_video_analysis"] = completed_result
@@ -829,8 +1075,12 @@ def process_video(
 def main() -> None:
     """Render the CornerCoach upload and inspection workflow."""
     st.set_page_config(page_title="CornerCoach", page_icon="🥊", layout="wide")
+    cpu_threads = configure_cpu_runtime()
     st.title("🥊 CornerCoach")
-    st.caption("CPU-first pose and kinematics inspection for boxing coaches")
+    st.caption(
+        "Tracked pose analysis with selectable trained LSTM or ST-GCN punch "
+        f"recognition | CPU threads: {cpu_threads}"
+    )
 
     uploaded_file = st.file_uploader(
         "Upload a fighter image or training video",
@@ -847,24 +1097,50 @@ def main() -> None:
         return
 
     try:
-        with st.spinner(
-            "Loading YOLO11 detector, ByteTrack, and YOLO11 pose on CPU…"
-        ):
-            pipeline = load_vision_pipeline()
         if suffix in IMAGE_EXTENSIONS:
+            with st.spinner("Loading YOLO11 and ByteTrack…"):
+                pipeline = load_vision_pipeline(single_pass_pose=True)
             process_image(uploaded_file, pipeline)
         else:
-            stance = st.sidebar.selectbox(
-                "Fighter stance",
-                options=["Orthodox", "Southpaw"],
-                index=0,
-                help="Used to distinguish lead-hand jabs from rear-hand crosses.",
+            selected_model = st.radio(
+                "Choose the trained punch-recognition model",
+                options=("LSTM", "ST-GCN"),
+                horizontal=True,
+                help=(
+                    "Both checkpoints use the saved 11-frame preprocessing schema "
+                    "and predict hand plus punch type."
+                ),
             )
-            settings = _analysis_settings_panel()
+            model_kind = "lstm" if selected_model == "LSTM" else "stgcn"
+            with st.spinner(f"Loading the trained {selected_model} checkpoint…"):
+                recognizer = load_trained_recognizer(model_kind)
+            st.caption(
+                f"Loaded {selected_model}: {recognizer.sequence_length}-frame windows · "
+                f"device {recognizer.device}."
+            )
+            background_recall = float(
+                recognizer.validation_metrics.get("background_detection_recall", 0.0)
+            )
+            if background_recall < 0.50:
+                st.warning(
+                    "Experimental checkpoint: held-out background recall is "
+                    f"{background_recall * 100:.1f}%. Punch counts may contain false "
+                    "positives; review the annotated video before using the report."
+                )
+            settings = _analysis_settings_panel(model_kind)
+            pipeline_mode = (
+                "single-pass CPU"
+                if settings["single_pass_pose"]
+                else "two-stage compatibility"
+            )
+            with st.spinner(f"Loading YOLO11 ({pipeline_mode} mode)…"):
+                pipeline = load_vision_pipeline(
+                    single_pass_pose=bool(settings["single_pass_pose"])
+                )
             process_video(
                 uploaded_file,
                 pipeline,
-                stance=stance.lower(),
+                recognizer,
                 settings=settings,
             )
     except Exception as exc:  # Streamlit should surface model/codec errors cleanly.

@@ -1,9 +1,9 @@
 ultralytics>=8.0.0
+torch>=2.1.0
 lap>=0.5.12
 opencv-python
 streamlit
 numpy
-scipy
-openai
-python-dotenv
 imageio-ffmpeg
+google-genai>=1.0.0
+reportlab>=4.0.0

@@ -1,17 +1,13 @@
-"""CPU-only YOLO11 pose inference and COCO keypoint parsing."""
+"""Device-selectable YOLO11 pose inference and COCO keypoint parsing."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Final
 
 import numpy as np
 
-# Keep Ultralytics/Torch on the CPU even on machines with a partially configured GPU.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-
-from ultralytics import YOLO  # noqa: E402  (environment must be set first)
+from ultralytics import YOLO
 
 
 COCO_KEYPOINT_NAMES: Final[tuple[str, ...]] = (
@@ -48,7 +44,7 @@ BOXING_KEYPOINT_INDICES: Final[dict[str, int]] = {
 
 
 class PoseEngine:
-    """Run YOLO11-pose inference on CPU.
+    """Run YOLO11-pose inference on the requested Torch device.
 
     The model file is downloaded automatically by Ultralytics when it is not
     already present. Model construction is deliberately kept in ``__init__``
@@ -59,15 +55,19 @@ class PoseEngine:
         self,
         weights: str | Path = "yolo11s-pose.pt",
         confidence_threshold: float = 0.25,
+        device: str = "cpu",
+        half: bool = False,
     ) -> None:
-        """Load the requested pose weights and pin all inference to CPU."""
+        """Load the requested pose weights on CPU, CUDA, or MPS."""
         if not 0.0 <= confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must be between 0 and 1")
 
         self.weights = str(weights)
         self.confidence_threshold = float(confidence_threshold)
+        self.device = str(device)
+        self.half = bool(half)
         self.model = YOLO(self.weights)
-        self.model.to("cpu")
+        self.model.to(self.device)
 
     def extract_keypoints(
         self,
@@ -97,12 +97,15 @@ class PoseEngine:
         elif imgsz <= 0:
             raise ValueError("imgsz must be positive")
 
-        results = self.model.predict(
-            source=frame,
-            imgsz=imgsz,
-            device="cpu",
-            verbose=False,
-        )
+        predict_options = {
+            "source": frame,
+            "imgsz": imgsz,
+            "device": self.device,
+            "verbose": False,
+        }
+        if self.half:
+            predict_options["half"] = True
+        results = self.model.predict(**predict_options)
         if not results:
             return None
 

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 
-from .punch_detector import PunchEvent
+
+class PunchEventLike(Protocol):
+    """Minimal punch event interface required by fatigue analysis."""
+
+    timestamp: float
+    speed: float
 
 
 @dataclass(frozen=True)
@@ -24,11 +30,6 @@ class FatigueReport:
     speed_drop_percent: float
     message: str
 
-    def to_dict(self) -> dict[str, object]:
-        """Return a serialization-friendly representation."""
-        return asdict(self)
-
-
 class FatigueAnalyzer:
     """Collect detected punches and compare early versus late output."""
 
@@ -40,9 +41,9 @@ class FatigueAnalyzer:
         """Set percentage drops that trigger the fatigue indicator."""
         self.work_rate_drop_threshold = float(work_rate_drop_threshold)
         self.speed_drop_threshold = float(speed_drop_threshold)
-        self.timeline: list[PunchEvent] = []
+        self.timeline: list[PunchEventLike] = []
 
-    def add_punch(self, event: PunchEvent) -> None:
+    def add_punch(self, event: PunchEventLike) -> None:
         """Append one classified punch to the session timeline."""
         self.timeline.append(event)
 

@@ -9,7 +9,6 @@ are mapped back to the untouched original video frame.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -18,11 +17,9 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+from ultralytics import YOLO
 
-from ultralytics import YOLO  # noqa: E402
-
-from .pose_engine import PoseEngine
+from .pose_engine import COCO_KEYPOINT_NAMES, PoseEngine
 
 
 ALLOWED_INFERENCE_SIZES: Final[tuple[int, int]] = (480, 640)
@@ -42,6 +39,13 @@ class LetterboxTransform:
     pad_y: int
     resized_width: int
     resized_height: int
+
+    def to_canvas_points(self, points: NDArray[np.floating]) -> NDArray[np.float32]:
+        """Map source-image x/y coordinates into the letterboxed canvas."""
+        output = np.asarray(points, dtype=np.float32).copy()
+        output[..., 0] = output[..., 0] * self.scale + self.pad_x
+        output[..., 1] = output[..., 1] * self.scale + self.pad_y
+        return output
 
     def to_source_points(self, points: NDArray[np.floating]) -> NDArray[np.float32]:
         """Map canvas x/y coordinates back to the source image."""
@@ -131,6 +135,9 @@ class TrackedBoxerPosePipeline:
         tracking_iou: float = 0.5,
         max_track_gap: int = 12,
         crop_padding: float = 0.10,
+        device: str = "cpu",
+        half: bool = False,
+        single_pass_pose: bool = True,
     ) -> None:
         if not 0.0 <= detection_confidence <= 1.0:
             raise ValueError("detection_confidence must be between 0 and 1")
@@ -141,10 +148,17 @@ class TrackedBoxerPosePipeline:
         if not 0.0 <= crop_padding <= 1.0:
             raise ValueError("crop_padding must be between 0 and 1")
         self.pose_engine = pose_engine
-        # A separate model instance prevents cropped pose calls from disturbing
-        # ByteTrack's persistent detector predictor and tracker state.
-        self.detector = YOLO(str(detector_weights))
-        self.detector.to("cpu")
+        self.device = str(device)
+        self.half = bool(half)
+        self.single_pass_pose = bool(single_pass_pose)
+        # Fast CPU mode shares one YOLO11-pose model and reuses the tracked
+        # full-frame keypoints. Compatibility mode retains the original second
+        # cropped-pose call and therefore needs an independent tracker model.
+        if self.single_pass_pose and str(detector_weights) == pose_engine.weights:
+            self.detector = pose_engine.model
+        else:
+            self.detector = YOLO(str(detector_weights))
+        self.detector.to(self.device)
         self.detection_confidence = float(detection_confidence)
         self.tracking_iou = float(tracking_iou)
         self.max_track_gap = int(max_track_gap)
@@ -181,7 +195,7 @@ class TrackedBoxerPosePipeline:
         ids: NDArray[np.int64],
         confidences: NDArray[np.float32],
         canvas_size: int,
-    ) -> tuple[int, NDArray[np.float32], float] | None:
+    ) -> tuple[int, int, NDArray[np.float32], float] | None:
         """Keep the locked ID; reacquire conservatively after a real loss."""
         if boxes.size == 0:
             return None
@@ -189,7 +203,7 @@ class TrackedBoxerPosePipeline:
             matches = np.flatnonzero(ids == self.target_track_id)
             if matches.size:
                 index = int(matches[0])
-                return int(ids[index]), boxes[index].copy(), float(confidences[index])
+                return index, int(ids[index]), boxes[index].copy(), float(confidences[index])
             if self._missing_frames <= self.max_track_gap:
                 return None
 
@@ -197,7 +211,7 @@ class TrackedBoxerPosePipeline:
             overlaps = np.asarray([self._iou(box, self._last_box) for box in boxes])
             index = int(np.argmax(overlaps))
             if overlaps[index] >= self.tracking_iou:
-                return int(ids[index]), boxes[index].copy(), float(confidences[index])
+                return index, int(ids[index]), boxes[index].copy(), float(confidences[index])
 
         # First acquisition: prioritize a large person near the frame center.
         areas = np.maximum(boxes[:, 2] - boxes[:, 0], 0.0) * np.maximum(boxes[:, 3] - boxes[:, 1], 0.0)
@@ -206,7 +220,54 @@ class TrackedBoxerPosePipeline:
         distances = np.linalg.norm((centers - canvas_center) / canvas_center, axis=1)
         scores = areas * confidences / (1.0 + distances)
         index = int(np.argmax(scores))
-        return int(ids[index]), boxes[index].copy(), float(confidences[index])
+        return index, int(ids[index]), boxes[index].copy(), float(confidences[index])
+
+    def _result_keypoints(
+        self,
+        result: object,
+        person_index: int,
+        transform: LetterboxTransform,
+    ) -> dict[str, NDArray[np.float32]] | None:
+        """Read one tracked person's pose and map it to original-frame pixels."""
+        result_keypoints = getattr(result, "keypoints", None)
+        if result_keypoints is None or result_keypoints.xy is None:
+            return None
+        xy = result_keypoints.xy.cpu().numpy()
+        if xy.ndim != 3 or person_index >= xy.shape[0] or xy.shape[1] < 17:
+            return None
+        confidence_tensor = result_keypoints.conf
+        if confidence_tensor is None:
+            confidence = np.ones(17, dtype=np.float32)
+        else:
+            confidence = (
+                confidence_tensor[person_index].cpu().numpy()[:17].astype(np.float32)
+            )
+        mapped_xy = transform.to_source_points(
+            xy[person_index, :17, :2].astype(np.float32)
+        )
+        points = np.column_stack((mapped_xy, confidence)).astype(np.float32)
+        points[points[:, 2] < self.pose_engine.confidence_threshold, :2] = np.nan
+        return {
+            name: points[index].copy()
+            for index, name in enumerate(COCO_KEYPOINT_NAMES)
+        }
+
+    @staticmethod
+    def _keypoints_to_crop_canvas(
+        keypoints: dict[str, NDArray[np.float32]],
+        crop_box: NDArray[np.int32],
+        transform: LetterboxTransform,
+    ) -> dict[str, NDArray[np.float32]]:
+        """Map original-frame keypoints into a diagnostic crop canvas."""
+        x1, y1, _, _ = crop_box
+        output: dict[str, NDArray[np.float32]] = {}
+        for name, point in keypoints.items():
+            mapped = np.asarray(point, dtype=np.float32).copy()
+            if np.all(np.isfinite(mapped[:2])):
+                crop_point = mapped[:2] - np.array([x1, y1], dtype=np.float32)
+                mapped[:2] = transform.to_canvas_points(crop_point)
+            output[name] = mapped
+        return output
 
     @staticmethod
     def _integer_crop_box(box: NDArray[np.float32], frame: NDArray[np.uint8]) -> NDArray[np.int32] | None:
@@ -267,19 +328,23 @@ class TrackedBoxerPosePipeline:
                 f"inference_size must be one of {ALLOWED_INFERENCE_SIZES}"
             )
         preprocessed, frame_transform = letterbox(frame, inference_size)
-        results = self.detector.track(
-            source=preprocessed,
-            persist=True,
-            tracker="bytetrack.yaml",
-            classes=[0],
-            conf=self.detection_confidence,
-            iou=0.7,
-            imgsz=inference_size,
-            device="cpu",
-            verbose=False,
-        )
+        track_options = {
+            "source": preprocessed,
+            "persist": True,
+            "tracker": "bytetrack.yaml",
+            "classes": [0],
+            "conf": self.detection_confidence,
+            "iou": 0.7,
+            "imgsz": inference_size,
+            "device": self.device,
+            "verbose": False,
+        }
+        if self.half:
+            track_options["half"] = True
+        results = self.detector.track(**track_options)
 
         selected = None
+        tracked_result = results[0] if results else None
         if results and results[0].boxes is not None and len(results[0].boxes):
             result_boxes = results[0].boxes
             boxes = result_boxes.xyxy.cpu().numpy().astype(np.float32)
@@ -291,8 +356,9 @@ class TrackedBoxerPosePipeline:
             selected = self._select_track(boxes, ids, confidences, inference_size)
 
         tracked: TrackedBox | None = None
+        selected_index: int | None = None
         if selected is not None:
-            track_id, canvas_box, confidence = selected
+            selected_index, track_id, canvas_box, confidence = selected
             original_box = frame_transform.to_source_box(canvas_box)
             tracked = TrackedBox(track_id, original_box, confidence, predicted=False)
             self.target_track_id = track_id
@@ -337,20 +403,45 @@ class TrackedBoxerPosePipeline:
         )
         exact_crop = frame[y1:y2, x1:x2]
         crop_canvas, crop_transform = letterbox(exact_crop, inference_size)
-        crop_keypoints = self.pose_engine.extract_keypoints(
-            crop_canvas,
-            imgsz=inference_size,
-        )
-        original_keypoints: dict[str, NDArray[np.float32]] | None = None
-        if crop_keypoints is not None:
-            original_keypoints = {}
-            for name, point in crop_keypoints.items():
-                mapped = np.asarray(point, dtype=np.float32).copy()
-                if np.all(np.isfinite(mapped[:2])):
-                    source_point = crop_transform.to_source_points(mapped[:2])
-                    mapped[0] = source_point[0] + x1
-                    mapped[1] = source_point[1] + y1
-                original_keypoints[name] = mapped
+        original_keypoints: dict[str, NDArray[np.float32]] | None
+        crop_keypoints: dict[str, NDArray[np.float32]] | None
+        if (
+            self.single_pass_pose
+            and tracked_result is not None
+            and selected_index is not None
+        ):
+            original_keypoints = self._result_keypoints(
+                tracked_result,
+                selected_index,
+                frame_transform,
+            )
+            crop_keypoints = (
+                self._keypoints_to_crop_canvas(
+                    original_keypoints,
+                    crop_box,
+                    crop_transform,
+                )
+                if original_keypoints is not None
+                else None
+            )
+        elif self.single_pass_pose:
+            original_keypoints = None
+            crop_keypoints = None
+        else:
+            crop_keypoints = self.pose_engine.extract_keypoints(
+                crop_canvas,
+                imgsz=inference_size,
+            )
+            original_keypoints = None
+            if crop_keypoints is not None:
+                original_keypoints = {}
+                for name, point in crop_keypoints.items():
+                    mapped = np.asarray(point, dtype=np.float32).copy()
+                    if np.all(np.isfinite(mapped[:2])):
+                        source_point = crop_transform.to_source_points(mapped[:2])
+                        mapped[0] = source_point[0] + x1
+                        mapped[1] = source_point[1] + y1
+                    original_keypoints[name] = mapped
 
         # Local import avoids a core/visualizer import cycle during unit tests.
         from visualizer.video_annotator import draw_skeleton

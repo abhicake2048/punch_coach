@@ -149,7 +149,7 @@ def draw_skeleton(
             )
 
     if punch_label:
-        text = f"PUNCH: {punch_label}"
+        text = punch_label
         text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
         x = max(10, (annotated.shape[1] - text_size[0]) // 2)
         cv2.putText(
