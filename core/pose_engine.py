@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import Final, Sequence
 
 import numpy as np
 
@@ -106,10 +106,32 @@ class PoseEngine:
         if self.half:
             predict_options["half"] = True
         results = self.model.predict(**predict_options)
-        if not results:
-            return None
+        return self._parse_result(results[0]) if results else None
 
-        result = results[0]
+    def extract_keypoints_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        imgsz: int | tuple[int, int] = (480, 640),
+    ) -> list[dict[str, np.ndarray] | None]:
+        """Run one batched YOLO call and return one pose dictionary per frame."""
+        if not frames:
+            return []
+        predict_options = {
+            "source": list(frames),
+            "imgsz": imgsz,
+            "device": self.device,
+            "verbose": False,
+            "rect": False,
+        }
+        if self.half:
+            predict_options["half"] = True
+        results = self.model.predict(**predict_options)
+        if len(results) != len(frames):
+            raise RuntimeError(f"YOLO returned {len(results)} results for {len(frames)} frames")
+        return [self._parse_result(result) for result in results]
+
+    def _parse_result(self, result) -> dict[str, np.ndarray] | None:
+        """Convert one Ultralytics pose result without triggering extra inference."""
         if result.keypoints is None or result.keypoints.xy is None:
             return None
 

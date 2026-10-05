@@ -18,7 +18,6 @@ Write-Host "Installing CornerCoach dependencies..."
 
 $RequiredWeights = @(
     "weights\yolo11s-pose.pt",
-    "weights\lstm\best_checkpoint.pt",
     "weights\stgcn\best_checkpoint.pt"
 )
 $MissingWeights = @($RequiredWeights | Where-Object {
@@ -29,4 +28,3 @@ if ($MissingWeights.Count -gt 0) {
 }
 
 Write-Host "Setup complete. Start the app with: .\run.ps1"
-

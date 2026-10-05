@@ -1,13 +1,13 @@
 # CornerCoach production inference
 
-CornerCoach analyzes an uploaded boxing video on CPU with YOLO11 pose and a
-selectable trained LSTM or ST-GCN. It reports punch counts, hand and punch type,
+CornerCoach analyzes an uploaded boxing video on CPU with two-stage YOLO11 pose
+and one trained ST-GCN. It reports punch counts, hand and punch type,
 guard discipline, fatigue indicators, a metric-grounded Gemini coaching report,
 an annotated video, and a downloadable PDF report.
 
 ## Start on Windows in three steps
 
-Requirements: Windows 10/11, 64-bit Python 3.10-3.12, and the three weight files
+Requirements: Windows 10/11, 64-bit Python 3.10-3.12, and the two weight files
 already included under `weights/`.
 
 1. Download or clone the repository, then open PowerShell in this `cornercoach`
@@ -58,7 +58,6 @@ app.py
 core/
 visualizer/
 weights/yolo11s-pose.pt
-weights/lstm/best_checkpoint.pt
 weights/stgcn/best_checkpoint.pt
 requirements.txt
 setup.ps1 and run.ps1
@@ -76,11 +75,14 @@ The app always preserves the training-time top-down preprocessing order:
 - The padded boxer crop is letterboxed without stretching.
 - A separate YOLO11s pose model extracts keypoints from that crop.
 - Crop keypoints are mapped back into original-frame coordinates before pose
-  smoothing, kinematics, and LSTM/ST-GCN inference.
+  smoothing, kinematics, and ST-GCN inference.
 
 The CPU-safe runtime optimizations are:
 
-- `YOLO input size`: 480 pixels.
+- Full-frame person detection uses 320 pixels while the cropped pose stage stays
+  at 480 pixels.
+- Both YOLO stages run in ordered CPU batches of eight frames, reducing 640
+  frames from roughly 1,280 individual model calls to about 160 batched calls.
 - `Live diagnostic preview`: disabled. Every video frame is still analyzed and
   written to the final annotated video; Streamlit simply avoids expensive image
   and chart redraws during processing.
@@ -106,7 +108,7 @@ use 11-frame motion sequences and fast punches may last only 5-8 frames.
 ## Using the app
 
 1. Upload an MP4/MOV video or JPG/PNG image.
-2. For video, choose LSTM or ST-GCN and adjust optional sidebar settings.
+2. For video, adjust optional ST-GCN and CPU-performance sidebar settings.
 3. Wait for the final dashboard and annotated video.
 4. Optionally provide a Gemini API key and select **Generate coaching report**.
 5. Select **Download coaching report PDF** to save the metrics, guard timeline,
@@ -122,8 +124,11 @@ Streamlit download button.
 
 - `weights/yolo11s-pose.pt`: mandatory full-frame person tracking followed by
   cropped top-down pose extraction.
-- `weights/lstm/best_checkpoint.pt`: 11-frame LSTM inference.
 - `weights/stgcn/best_checkpoint.pt`: 11-frame ST-GCN inference.
+
+The active ST-GCN checkpoint is loaded from `weights/stgcn/`. The retired LSTM
+checkpoint is archived under `extras/retired_lstm/` and is not loaded by the
+app. The YOLO pose checkpoint is unchanged.
 
 A punch is counted only when the configured joint hand/punch confidence exceeds
 the enforced minimum and the wrist-speed, outward-extension, peak-prominence,
@@ -133,13 +138,16 @@ and recovery gates also pass. Predictions below the threshold remain `IDLE`.
 
 - **PowerShell script execution is blocked:** use the full
   `powershell -ExecutionPolicy Bypass -File ...` commands shown above.
-- **A checkpoint is missing:** restore the exact three files listed under
+- **A checkpoint is missing:** restore the exact two files listed under
   Required production files and rerun setup.
 - **Gemini report button is disabled:** pass `-GeminiApiKey` to `run.ps1`, set
   `GEMINI_API_KEY`, or place it in Streamlit secrets.
-- **CPU inference is still slow:** keep 480 pixels and live preview disabled.
-  Test `CORNERCOACH_CPU_THREADS` values 2, 4, and 8 on the target machine. The
-  top-down crop/pose stage remains mandatory for checkpoint compatibility.
+- **CPU inference is still slow:** keep detection at 320, pose at 480, batch
+  size at 8, and live preview disabled. Test `CORNERCOACH_CPU_THREADS` values 2,
+  4, and 8. If memory is limited, lower the batch size to 4. The two-stage
+  detector-to-cropped-pose process remains mandatory.
 
 Runtime logs are written under `logs/`. Training code and historical utilities
-remain under `Extras/` and are not needed to launch the app.
+remain under `extras/` and are not needed to launch the app. The exact class
+mapping, feature order, checkpoint hashes, and runtime interpretation are listed
+in `weights/MODEL_FEATURE_GUIDE.md`.

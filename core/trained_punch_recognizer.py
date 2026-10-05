@@ -1,4 +1,4 @@
-"""Production inference for the trained multi-task LSTM and ST-GCN models."""
+"""Production inference for the trained multi-task ST-GCN model."""
 
 from __future__ import annotations
 
@@ -18,11 +18,29 @@ from .punch_features import (
     normalize_pose_at_neck,
     pose_to_record,
 )
-from .punch_models import MultiTaskLSTM, MultiTaskSTGCN
+from .punch_models import MultiTaskSTGCN
 
 
-SUPPORTED_MODELS: Final[tuple[str, ...]] = ("lstm", "stgcn")
+PRODUCTION_MODEL: Final[str] = "stgcn"
 MINIMUM_PUNCH_CONFIDENCE: Final[float] = 0.91
+RUNTIME_SCHEMA_VERSION: Final[int] = 1
+EXPECTED_HAND_CLASSES: Final[tuple[str, ...]] = ("none", "left", "right")
+EXPECTED_PUNCH_CLASSES: Final[tuple[str, ...]] = (
+    "background",
+    "cross",
+    "jab",
+    "hook",
+    "uppercut",
+)
+EXPECTED_STGCN_CHANNELS: Final[tuple[str, ...]] = (
+    "x",
+    "y",
+    "confidence",
+    "vx",
+    "vy",
+    "ax",
+    "ay",
+)
 
 
 @dataclass(frozen=True)
@@ -91,7 +109,7 @@ class TrainedPunchRecognizer:
         self,
         checkpoint_path: str | Path,
         *,
-        model_kind: str | None = None,
+        model_kind: str = PRODUCTION_MODEL,
         device: str = "auto",
         confidence_threshold: float = MINIMUM_PUNCH_CONFIDENCE,
         keypoint_confidence: float = 0.25,
@@ -113,9 +131,12 @@ class TrainedPunchRecognizer:
             weights_only=True,
         )
         checkpoint_kind = str(checkpoint.get("model_kind", "")).lower()
-        requested_kind = (model_kind or checkpoint_kind).lower()
-        if requested_kind not in SUPPORTED_MODELS:
-            raise ValueError(f"Unsupported model kind: {requested_kind!r}")
+        requested_kind = str(model_kind).lower()
+        if requested_kind != PRODUCTION_MODEL:
+            raise ValueError(
+                f"Production inference supports only {PRODUCTION_MODEL!r}, "
+                f"not {requested_kind!r}"
+            )
         if checkpoint_kind and checkpoint_kind != requested_kind:
             raise ValueError(
                 f"Checkpoint contains {checkpoint_kind!r}, not {requested_kind!r}"
@@ -128,16 +149,28 @@ class TrainedPunchRecognizer:
             raise ValueError("Checkpoint sequence length must be positive")
         self.hand_classes = self._ordered_classes(checkpoint["hand_classes"])
         self.punch_classes = self._ordered_classes(checkpoint["punch_type_classes"])
+        self._validate_checkpoint_contract()
         self.model = self._build_model(checkpoint)
         self.model.load_state_dict(checkpoint["model_state"], strict=True)
         self.model.eval()
 
         stats = checkpoint["feature_stats"]
-        stat_key = "lstm_kinematic" if self.model_kind == "lstm" else "stgcn_kinematic"
+        stat_key = "stgcn_kinematic"
         self.feature_mean = np.asarray(stats[stat_key]["mean"], dtype=np.float32)
         self.feature_std = np.asarray(stats[stat_key]["std"], dtype=np.float32)
         if self.feature_mean.shape != self.feature_std.shape:
             raise ValueError("Checkpoint feature mean/std shapes do not match")
+        feature_key = "stgcn_kinematic_features"
+        expected_stat_count = len(self.schema[feature_key])
+        if self.feature_mean.ndim != 1 or self.feature_mean.size != expected_stat_count:
+            raise ValueError(
+                f"Checkpoint {stat_key} statistics contain {self.feature_mean.size} "
+                f"values; {expected_stat_count} are required by {feature_key}"
+            )
+        if not np.all(np.isfinite(self.feature_mean)):
+            raise ValueError(f"Checkpoint {stat_key} mean contains non-finite values")
+        if not np.all(np.isfinite(self.feature_std)):
+            raise ValueError(f"Checkpoint {stat_key} std contains non-finite values")
         self.feature_std = self.feature_std.copy()
         self.feature_std[self.feature_std < 1e-6] = 1.0
 
@@ -172,35 +205,69 @@ class TrainedPunchRecognizer:
             raise ValueError(f"Class IDs must be contiguous from zero: {dict(class_map)}")
         return tuple(name for name, _ in ordered)
 
+    def _validate_checkpoint_contract(self) -> None:
+        """Reject a checkpoint whose saved training contract cannot run safely."""
+        schema_version = int(self.schema.get("schema_version", -1))
+        if schema_version != RUNTIME_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported feature schema version {schema_version}; "
+                f"runtime expects {RUNTIME_SCHEMA_VERSION}"
+            )
+        if self.hand_classes != EXPECTED_HAND_CLASSES:
+            raise ValueError(
+                "Checkpoint hand classes must be ordered as "
+                f"{EXPECTED_HAND_CLASSES}, received {self.hand_classes}"
+            )
+        if self.punch_classes != EXPECTED_PUNCH_CLASSES:
+            raise ValueError(
+                "Checkpoint punch classes must be ordered as "
+                f"{EXPECTED_PUNCH_CLASSES}, received {self.punch_classes}"
+            )
+
+        required_feature_keys = ("stgcn_channels", "stgcn_kinematic_features")
+        for key in required_feature_keys:
+            values = self.schema.get(key)
+            if not isinstance(values, (list, tuple)) or not values:
+                raise ValueError(f"Checkpoint feature schema is missing non-empty {key}")
+            if len(values) != len(set(values)):
+                raise ValueError(f"Checkpoint feature schema contains duplicate {key}")
+
+        channels = tuple(str(value) for value in self.schema["stgcn_channels"])
+        if channels != EXPECTED_STGCN_CHANNELS:
+            raise ValueError(
+                f"ST-GCN channels must be {EXPECTED_STGCN_CHANNELS}, received {channels}"
+            )
+
     def _build_model(self, checkpoint: Mapping[str, Any]) -> torch.nn.Module:
         config = dict(checkpoint.get("config", {}))
-        if self.model_kind == "lstm":
-            model = MultiTaskLSTM(
-                input_size=len(self.schema["lstm_kinematic_features"]),
-                hidden_size=int(config.get("hidden_size", 128)),
-                num_layers=int(config.get("num_layers", 2)),
-                dropout=float(config.get("dropout", 0.5)),
-                hand_classes=len(self.hand_classes),
-                punch_classes=len(self.punch_classes),
-            )
-        else:
-            model = MultiTaskSTGCN(
-                input_channels=len(self.schema["stgcn_channels"]),
-                kinematic_features=len(self.schema["stgcn_kinematic_features"]),
-                dropout=float(config.get("dropout", 0.3)),
-                hand_classes=len(self.hand_classes),
-                punch_classes=len(self.punch_classes),
-            )
+        model = MultiTaskSTGCN(
+            input_channels=len(self.schema["stgcn_channels"]),
+            kinematic_features=len(self.schema["stgcn_kinematic_features"]),
+            dropout=float(config.get("dropout", 0.3)),
+            hand_classes=len(self.hand_classes),
+            punch_classes=len(self.punch_classes),
+        )
         return model.to(self.device)
 
     @property
     def display_name(self) -> str:
-        return "LSTM" if self.model_kind == "lstm" else "ST-GCN"
+        return "ST-GCN"
 
     @property
     def effective_confidence_threshold(self) -> float:
-        """Never allow production punch registration below 78 percent."""
+        """Never allow production punch registration below 91 percent."""
         return max(MINIMUM_PUNCH_CONFIDENCE, float(self.confidence_threshold))
+
+    @property
+    def action_labels(self) -> tuple[str, ...]:
+        """Return the nine user-facing actions represented by the two heads."""
+        punches = tuple(
+            f"{hand.title()} {punch_type.title()}"
+            for hand in ("left", "right")
+            for punch_type in self.punch_classes
+            if punch_type != "background"
+        )
+        return ("IDLE", *punches)
 
     @property
     def current_confidence(self) -> float:
@@ -208,7 +275,7 @@ class TrainedPunchRecognizer:
 
     @property
     def current_label(self) -> str:
-        """Return a punch label only when its joint confidence exceeds 78%."""
+        """Return a punch label only when its joint confidence exceeds 91%."""
         prediction = self.latest_prediction
         if (
             prediction is None
@@ -287,14 +354,6 @@ class TrainedPunchRecognizer:
         )
         if arrays is None:
             return None
-        if self.model_kind == "lstm":
-            features = arrays["lstm_kinematic"].astype(np.float32)
-            if features.shape[1] != self.feature_mean.size:
-                raise ValueError(
-                    f"LSTM feature mismatch: {features.shape[1]} != {self.feature_mean.size}"
-                )
-            features = (features - self.feature_mean) / self.feature_std
-            return (torch.from_numpy(features).unsqueeze(0).to(self.device),)
         graph = torch.from_numpy(arrays["stgcn"]).unsqueeze(0).to(self.device)
         kinematics = arrays["stgcn_kinematic"].astype(np.float32)
         if kinematics.shape[1] != self.feature_mean.size:

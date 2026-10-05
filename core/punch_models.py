@@ -1,4 +1,4 @@
-"""Runtime-only multi-task LSTM and ST-GCN architectures."""
+"""Runtime-only multi-task ST-GCN architecture."""
 
 from __future__ import annotations
 
@@ -25,38 +25,6 @@ def coco_adjacency() -> torch.Tensor:
     degree = adjacency.sum(axis=1)
     inverse = np.diag(np.power(np.maximum(degree, 1e-12), -0.5))
     return torch.tensor(inverse @ adjacency @ inverse, dtype=torch.float32)
-
-
-class MultiTaskLSTM(nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.5,
-        hand_classes: int = 3,
-        punch_classes: int = 5,
-    ) -> None:
-        super().__init__()
-        self.lstm = nn.LSTM(
-            int(input_size),
-            int(hidden_size),
-            int(num_layers),
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-        self.norm = nn.LayerNorm(int(hidden_size))
-        self.dropout = nn.Dropout(dropout)
-        self.hand_head = nn.Linear(int(hidden_size), int(hand_classes))
-        self.punch_head = nn.Linear(int(hidden_size), int(punch_classes))
-
-    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
-        sequence, _ = self.lstm(inputs)
-        shared = self.dropout(self.norm(sequence[:, -1]))
-        return {
-            "hand": self.hand_head(shared),
-            "punch_type": self.punch_head(shared),
-        }
 
 
 class SpatialGraphConv(nn.Module):

@@ -247,11 +247,9 @@ def build_runtime_arrays(
         confidence_name = f"{joint}_confidence"
         confidence = np.asarray([row.get(confidence_name, 0.0) for row in records], dtype=np.float32)
         columns[confidence_name] = np.nan_to_num(confidence, nan=0.0)
-    for name in set(schema["lstm_kinematic_features"]) | set(schema["stgcn_kinematic_features"]):
+    for name in set(schema["stgcn_kinematic_features"]):
         if name not in columns:
             columns[name] = np.asarray([row.get(name, np.nan) for row in records], dtype=np.float32)
-    rich = np.column_stack([columns[name] for name in schema["lstm_kinematic_features"]])
-    rich = np.nan_to_num(rich, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     positions = np.zeros((2, length, 17), dtype=np.float32)
     confidence = np.zeros((length, 17), dtype=np.float32)
     for joint_index, joint in enumerate(COCO_KEYPOINT_NAMES):
@@ -278,7 +276,6 @@ def build_runtime_arrays(
         [columns[name] for name in schema["stgcn_kinematic_features"]]
     )
     return {
-        "lstm_kinematic": rich,
         "stgcn": graph.astype(np.float32),
         "stgcn_kinematic": np.nan_to_num(
             graph_kinematics, nan=0.0, posinf=0.0, neginf=0.0

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 import hashlib
 import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -84,13 +86,12 @@ def load_vision_pipeline() -> TrackedBoxerPosePipeline:
 
 
 @st.cache_resource(show_spinner=False)
-def load_trained_recognizer(model_kind: str) -> TrainedPunchRecognizer:
-    """Load the user-selected multi-task punch checkpoint once."""
-    normalized_kind = model_kind.strip().lower()
+def load_trained_recognizer() -> TrainedPunchRecognizer:
+    """Load the production ST-GCN punch checkpoint once."""
     return TrainedPunchRecognizer(
-        checkpoint_path=PROJECT_ROOT / "weights" / normalized_kind / "best_checkpoint.pt",
-        model_kind=normalized_kind,
-        device="auto",
+        checkpoint_path=PROJECT_ROOT / "weights" / "stgcn" / "best_checkpoint.pt",
+        model_kind="stgcn",
+        device="cpu",
     )
 
 
@@ -349,17 +350,34 @@ def _render_session_dashboard(
     )
 
 
-def _analysis_settings_panel(model_kind: str) -> dict[str, Any]:
-    """Expose selected-model recognition, guard, and fatigue controls."""
-    model_label = "LSTM" if model_kind == "lstm" else "ST-GCN"
-    with st.sidebar.expander(f"YOLO + {model_label} recognition", expanded=False):
+def _analysis_settings_panel() -> dict[str, Any]:
+    """Expose ST-GCN recognition, CPU batching, guard, and fatigue controls."""
+    with st.sidebar.expander("YOLO + ST-GCN recognition", expanded=False):
+        detection_size = st.select_slider(
+            "Person-detection input size (pixels)",
+            options=[320, 384, 416, 480],
+            value=320,
+            help=(
+                "The first YOLO stage only locates the boxer. 320px is the "
+                "fast CPU default; the cropped pose stage remains at 480px."
+            ),
+        )
         inference_size = st.select_slider(
-            "YOLO input size (pixels)",
+            "Cropped-pose input size (pixels)",
             options=[480, 640],
             value=480,
             help=(
-                "Both detector and pose use a square letterbox of this size. "
-                "Source pixels retain their original aspect ratio."
+                "The second YOLO stage extracts keypoints from the tracked boxer "
+                "crop. 480px matches the fast production feature pipeline."
+            ),
+        )
+        cpu_batch_size = st.select_slider(
+            "CPU inference batch size",
+            options=[1, 2, 4, 8, 12, 16],
+            value=8,
+            help=(
+                "Batches both YOLO stages while preserving frame order. Reduce "
+                "this only if the computer runs out of memory."
             ),
         )
         model_confidence = st.slider(
@@ -453,8 +471,10 @@ def _analysis_settings_panel(model_kind: str) -> dict[str, Any]:
         )
 
     return {
-        "model_kind": model_kind,
+        "model_kind": "stgcn",
+        "detection_size": int(detection_size),
         "inference_size": int(inference_size),
+        "cpu_batch_size": int(cpu_batch_size),
         "model_confidence": float(model_confidence),
         "keypoint_confidence": float(keypoint_confidence),
         "recovery_frames": int(recovery_frames),
@@ -655,6 +675,12 @@ def _render_completed_video(result: dict[str, Any], reused: bool = False) -> Non
         "Wrist speed is normalized to torso lengths per second; missing pose "
         "measurements are represented as chart gaps."
     )
+    processing_fps = float(result.get("processing_fps", 0.0))
+    if processing_fps > 0.0:
+        st.caption(
+            f"Measured end-to-end processing throughput: {processing_fps:.2f} "
+            "frames/second on this computer."
+        )
     with st.expander("Parameters used for this analysis"):
         st.json(result["settings"])
     if LOG_PATH.exists():
@@ -674,7 +700,7 @@ def process_video(
     settings: dict[str, Any] | None = None,
 ) -> None:
     """Analyze an uploaded video, showing live frames and an annotated result."""
-    active_settings = settings or _analysis_settings_panel(recognizer.model_kind)
+    active_settings = settings or _analysis_settings_panel()
     source_bytes = uploaded_file.getvalue()
     analysis_key = _completed_analysis_key(
         source_bytes,
@@ -795,16 +821,33 @@ def process_video(
         frame_index = 0
         flash_label: str | None = None
         flash_until = -1.0
+        pending_frames: deque[tuple[np.ndarray, Any]] = deque()
+        cpu_batch_size = max(1, int(active_settings.get("cpu_batch_size", 8)))
+        inference_started = time.perf_counter()
 
         while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
+            if not pending_frames:
+                frame_batch: list[np.ndarray] = []
+                for _ in range(cpu_batch_size):
+                    ok, batch_frame = capture.read()
+                    if not ok:
+                        break
+                    frame_batch.append(batch_frame)
+                if not frame_batch:
+                    break
+                stage_batch = pipeline.process_batch(
+                    frame_batch,
+                    inference_size=int(active_settings["inference_size"]),
+                    detection_size=int(active_settings["detection_size"]),
+                    draw_diagnostics=True,
+                )
+                if len(stage_batch) != len(frame_batch):
+                    raise RuntimeError(
+                        "Batched pose pipeline returned a different frame count"
+                    )
+                pending_frames.extend(zip(frame_batch, stage_batch))
 
-            stages = pipeline.process(
-                frame,
-                inference_size=int(active_settings["inference_size"]),
-            )
+            frame, stages = pending_frames.popleft()
             raw_keypoints = stages.raw_keypoints_original
             elapsed = frame_index / fps
             processed_pose = signal_processor.update(raw_keypoints, timestamp=elapsed)
@@ -901,7 +944,7 @@ def process_video(
                 preprocess_placeholder.image(
                     cv2.cvtColor(stages.preprocessed_frame, cv2.COLOR_BGR2RGB),
                     caption=(
-                        f"1 · {active_settings['inference_size']}px square letterbox"
+                        f"1 · {active_settings['detection_size']}px detection letterbox"
                     ),
                     channels="RGB",
                     use_container_width=True,
@@ -934,10 +977,9 @@ def process_video(
                     channels="RGB",
                     use_container_width=True,
                 )
-                pose_display = (
-                    stages.pose_crop_frame
-                    if stages.pose_crop_frame is not None
-                    else crop_display
+                pose_display = draw_skeleton(
+                    crop_display,
+                    stages.raw_keypoints_crop,
                 )
                 pose_placeholder.image(
                     cv2.cvtColor(pose_display, cv2.COLOR_BGR2RGB),
@@ -1018,6 +1060,8 @@ def process_video(
         progress.progress(1.0, text=f"Finished {frame_index:,} frames")
 
         duration_seconds = frame_index / fps
+        inference_wall_seconds = max(time.perf_counter() - inference_started, 1e-9)
+        processing_fps = frame_index / inference_wall_seconds
         punch_summary = recognizer.summary(duration_seconds)
         guard_monitor.finalize(duration_seconds)
         guard_summary = guard_monitor.summary()
@@ -1031,6 +1075,7 @@ def process_video(
             "guard_summary": guard_summary,
             "fatigue_report": fatigue_report,
             "duration_seconds": duration_seconds,
+            "processing_fps": processing_fps,
             "settings": active_settings,
         }
         st.session_state["completed_video_analysis"] = completed_result
@@ -1038,7 +1083,8 @@ def process_video(
         LOGGER.info(
             "VIDEO_SUMMARY file=%s duration=%.3fs total_punches=%d ppm=%.2f "
             "by_type=%s by_hand=%s guard_score=%.2f%% guard_drops=%s "
-            "fatigued=%s work_rate_drop=%.2f%% speed_drop=%.2f%%",
+            "fatigued=%s work_rate_drop=%.2f%% speed_drop=%.2f%% "
+            "processing_fps=%.2f wall_seconds=%.2f",
             uploaded_file.name,
             duration_seconds,
             punch_summary["total_punches"],
@@ -1050,6 +1096,8 @@ def process_video(
             fatigue_report.fatigued,
             fatigue_report.work_rate_drop_percent,
             fatigue_report.speed_drop_percent,
+            processing_fps,
+            inference_wall_seconds,
         )
 
     finally:
@@ -1068,7 +1116,7 @@ def main() -> None:
     cpu_threads = configure_cpu_runtime()
     st.title("🥊 CornerCoach")
     st.caption(
-        "Tracked pose analysis with selectable trained LSTM or ST-GCN punch "
+        "Batched two-stage YOLO pose analysis with trained ST-GCN punch "
         f"recognition | CPU threads: {cpu_threads}"
     )
 
@@ -1092,20 +1140,10 @@ def main() -> None:
                 pipeline = load_vision_pipeline()
             process_image(uploaded_file, pipeline)
         else:
-            selected_model = st.radio(
-                "Choose the trained punch-recognition model",
-                options=("LSTM", "ST-GCN"),
-                horizontal=True,
-                help=(
-                    "Both checkpoints use the saved 11-frame preprocessing schema "
-                    "and predict hand plus punch type."
-                ),
-            )
-            model_kind = "lstm" if selected_model == "LSTM" else "stgcn"
-            with st.spinner(f"Loading the trained {selected_model} checkpoint…"):
-                recognizer = load_trained_recognizer(model_kind)
+            with st.spinner("Loading the trained ST-GCN checkpoint…"):
+                recognizer = load_trained_recognizer()
             st.caption(
-                f"Loaded {selected_model}: {recognizer.sequence_length}-frame windows · "
+                f"Loaded ST-GCN: {recognizer.sequence_length}-frame windows · "
                 f"device {recognizer.device}."
             )
             background_recall = float(
@@ -1117,7 +1155,7 @@ def main() -> None:
                     f"{background_recall * 100:.1f}%. Punch counts may contain false "
                     "positives; review the annotated video before using the report."
                 )
-            settings = _analysis_settings_panel(model_kind)
+            settings = _analysis_settings_panel()
             with st.spinner("Loading YOLO11 top-down pose pipeline…"):
                 pipeline = load_vision_pipeline()
             process_video(

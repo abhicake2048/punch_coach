@@ -16,5 +16,8 @@ test_files/
 # Python cache and compiled files
 __pycache__/
 *.pyc
-Extras/
+extras/*
+!extras/README.md
+!extras/retired_lstm/
+!extras/retired_lstm/**
 output/

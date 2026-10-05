@@ -1,17 +1,15 @@
 """Tracked top-down boxer detection and cropped YOLO11 pose inference.
 
-The detector operates on a selectable 480px or 640px square letterbox,
-ByteTrack keeps the selected person's identity stable, and pose inference is
-restricted to an equally sized aspect-preserving crop of that tracked boxer.
-All public coordinates
-are mapped back to the untouched original video frame.
+The full-frame detector can run at a smaller CPU-friendly resolution than the
+cropped pose stage. Frame-order association keeps the selected person stable,
+and all public coordinates are mapped back to the untouched original frame.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, Sequence
 
 import cv2
 import numpy as np
@@ -23,6 +21,7 @@ from .pose_engine import PoseEngine
 
 
 ALLOWED_INFERENCE_SIZES: Final[tuple[int, int]] = (480, 640)
+ALLOWED_DETECTION_SIZES: Final[tuple[int, ...]] = (320, 384, 416, 480, 640)
 DEFAULT_INFERENCE_SIZE: Final[int] = 640
 
 
@@ -261,6 +260,7 @@ class TrackedBoxerPosePipeline:
         self,
         frame: NDArray[np.uint8],
         inference_size: int = DEFAULT_INFERENCE_SIZE,
+        detection_size: int | None = None,
     ) -> PipelineFrame:
         """Process one original frame and return every diagnostic stage."""
         inference_size = int(inference_size)
@@ -268,7 +268,12 @@ class TrackedBoxerPosePipeline:
             raise ValueError(
                 f"inference_size must be one of {ALLOWED_INFERENCE_SIZES}"
             )
-        preprocessed, frame_transform = letterbox(frame, inference_size)
+        detection_size = inference_size if detection_size is None else int(detection_size)
+        if detection_size not in ALLOWED_DETECTION_SIZES:
+            raise ValueError(
+                f"detection_size must be one of {ALLOWED_DETECTION_SIZES}"
+            )
+        preprocessed, frame_transform = letterbox(frame, detection_size)
         track_options = {
             "source": preprocessed,
             "persist": True,
@@ -276,7 +281,7 @@ class TrackedBoxerPosePipeline:
             "classes": [0],
             "conf": self.detection_confidence,
             "iou": 0.7,
-            "imgsz": inference_size,
+            "imgsz": detection_size,
             "device": self.device,
             "verbose": False,
         }
@@ -293,7 +298,7 @@ class TrackedBoxerPosePipeline:
                 ids = np.arange(len(boxes), dtype=np.int64)
             else:
                 ids = result_boxes.id.cpu().numpy().astype(np.int64)
-            selected = self._select_track(boxes, ids, confidences, inference_size)
+            selected = self._select_track(boxes, ids, confidences, detection_size)
 
         tracked: TrackedBox | None = None
         if selected is not None:
@@ -371,3 +376,108 @@ class TrackedBoxerPosePipeline:
             raw_keypoints_original=original_keypoints,
             raw_keypoints_crop=crop_keypoints,
         )
+
+    def process_batch(
+        self,
+        frames: Sequence[NDArray[np.uint8]],
+        inference_size: int = DEFAULT_INFERENCE_SIZE,
+        detection_size: int | None = None,
+        draw_diagnostics: bool = False,
+    ) -> list[PipelineFrame]:
+        """Batch both YOLO stages while associating the boxer in frame order."""
+        if not frames:
+            return []
+        inference_size = int(inference_size)
+        if inference_size not in ALLOWED_INFERENCE_SIZES:
+            raise ValueError(f"inference_size must be one of {ALLOWED_INFERENCE_SIZES}")
+        detection_size = inference_size if detection_size is None else int(detection_size)
+        if detection_size not in ALLOWED_DETECTION_SIZES:
+            raise ValueError(f"detection_size must be one of {ALLOWED_DETECTION_SIZES}")
+        preprocessed, transforms = [], []
+        for frame in frames:
+            canvas, transform = letterbox(frame, detection_size)
+            preprocessed.append(canvas)
+            transforms.append(transform)
+        options = {
+            "source": preprocessed, "classes": [0], "conf": self.detection_confidence,
+            "iou": 0.7, "imgsz": detection_size, "device": self.device,
+            "verbose": False, "rect": False,
+        }
+        if self.half:
+            options["half"] = True
+        detection_results = self.detector.predict(**options)
+        if len(detection_results) != len(frames):
+            raise RuntimeError(
+                "YOLO detector returned "
+                f"{len(detection_results)} results for {len(frames)} frames"
+            )
+        tracked_rows: list[TrackedBox | None] = []
+        crop_boxes: list[NDArray[np.int32] | None] = []
+        crop_canvases: list[NDArray[np.uint8]] = []
+        crop_transforms: list[LetterboxTransform] = []
+        crop_indices: list[int] = []
+        for index, (frame, transform, result) in enumerate(zip(frames, transforms, detection_results)):
+            selected = None
+            if result.boxes is not None and len(result.boxes):
+                boxes = result.boxes.xyxy.cpu().numpy().astype(np.float32)
+                confidences = result.boxes.conf.cpu().numpy().astype(np.float32)
+                if self._last_box is not None:
+                    overlaps = np.asarray([self._iou(box, self._last_box) for box in boxes])
+                    candidate = int(np.argmax(overlaps))
+                    if overlaps[candidate] >= self.tracking_iou or self._missing_frames <= self.max_track_gap:
+                        selected = (boxes[candidate], float(confidences[candidate]))
+                if selected is None:
+                    areas = np.maximum(boxes[:, 2] - boxes[:, 0], 0) * np.maximum(boxes[:, 3] - boxes[:, 1], 0)
+                    centers = (boxes[:, :2] + boxes[:, 2:]) / 2
+                    center = np.array([detection_size / 2, detection_size / 2], dtype=np.float32)
+                    scores = areas * confidences / (1 + np.linalg.norm((centers - center) / center, axis=1))
+                    candidate = int(np.argmax(scores))
+                    selected = (boxes[candidate], float(confidences[candidate]))
+            tracked = None
+            if selected is not None:
+                canvas_box, confidence = selected
+                self._last_box = canvas_box.copy()
+                self.target_track_id = 1
+                self._missing_frames = 0
+                tracked = TrackedBox(1, transform.to_source_box(canvas_box), confidence, False)
+            elif self._last_box is not None and self._missing_frames < self.max_track_gap:
+                self._missing_frames += 1
+                tracked = TrackedBox(1, transform.to_source_box(self._last_box), 0.0, True)
+            else:
+                self._missing_frames += 1
+            tracked_rows.append(tracked)
+            crop_box = None if tracked is None else self._integer_crop_box(self._padded_box(tracked.xyxy, frame), frame)
+            crop_boxes.append(crop_box)
+            if crop_box is not None:
+                x1, y1, x2, y2 = crop_box
+                canvas, crop_transform = letterbox(frame[y1:y2, x1:x2], inference_size)
+                crop_canvases.append(canvas)
+                crop_transforms.append(crop_transform)
+                crop_indices.append(index)
+        crop_poses = self.pose_engine.extract_keypoints_batch(crop_canvases, imgsz=inference_size)
+        poses_by_index = {index: pose for index, pose in zip(crop_indices, crop_poses)}
+        transform_by_index = {index: transform for index, transform in zip(crop_indices, crop_transforms)}
+        crop_by_index = {index: crop for index, crop in zip(crop_indices, crop_canvases)}
+        outputs: list[PipelineFrame] = []
+        for index, frame in enumerate(frames):
+            crop_box = crop_boxes[index]
+            crop_pose = poses_by_index.get(index)
+            original_pose = None
+            if crop_box is not None and crop_pose is not None:
+                x1, y1, _, _ = crop_box
+                crop_transform = transform_by_index[index]
+                original_pose = {}
+                for name, point in crop_pose.items():
+                    mapped = np.asarray(point, dtype=np.float32).copy()
+                    if np.all(np.isfinite(mapped[:2])):
+                        source = crop_transform.to_source_points(mapped[:2])
+                        mapped[0], mapped[1] = source[0] + x1, source[1] + y1
+                    original_pose[name] = mapped
+            detection_frame = self._draw_tracking(frame, tracked_rows[index]) if draw_diagnostics else frame
+            outputs.append(PipelineFrame(
+                preprocessed_frame=preprocessed[index], detection_frame=detection_frame,
+                crop_frame=crop_by_index.get(index),
+                pose_crop_frame=None, tracked_box=tracked_rows[index], crop_box_xyxy=crop_box,
+                raw_keypoints_original=original_pose, raw_keypoints_crop=crop_pose,
+            ))
+        return outputs

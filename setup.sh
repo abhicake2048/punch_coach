@@ -14,7 +14,6 @@ fi
 
 for weight in \
   weights/yolo11s-pose.pt \
-  weights/lstm/best_checkpoint.pt \
   weights/stgcn/best_checkpoint.pt; do
   if [[ ! -f "$weight" ]]; then
     echo "Missing production weight: $weight" >&2
@@ -23,4 +22,3 @@ for weight in \
 done
 
 echo "Setup complete. Start the app with: bash run.sh"
-
