@@ -105,6 +105,21 @@ features extracted with this top-down approach.
 The application does not skip inference frames because the trained checkpoints
 use 11-frame motion sequences and fast punches may last only 5-8 frames.
 
+## Multiple users
+
+The YOLO predictors, boxer tracker, and ST-GCN temporal state are shared to stay
+within small cloud-memory limits, but they are protected by a process-wide FIFO
+coordinator. One upload runs inference at a time. Additional visitors see a
+waiting message and begin automatically in upload order when the worker is
+released. Cached completed results and report viewing remain session-specific
+and do not wait in the inference queue.
+
+The worker ticket is released from a nested `finally` block after success,
+invalid media, or an inference exception, preventing one failed upload from
+blocking later users. Streamlit Cloud defaults to batch size 4 and up to four
+PyTorch CPU threads; larger hosts can select batch size 8 or set
+`CORNERCOACH_CPU_THREADS` explicitly.
+
 ## Using the app
 
 1. Upload an MP4/MOV video or JPG/PNG image.

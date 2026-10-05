@@ -10,6 +10,7 @@ import os
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from core.coaching_report import (
 )
 from core.fatigue_analyzer import FatigueAnalyzer, FatigueReport
 from core.guard_monitor import GuardMonitor
+from core.inference_coordinator import InferenceCoordinator, InferenceTicket
 from core.logging_config import configure_logging
 from core.boxer_pipeline import TrackedBoxerPosePipeline
 from core.pose_engine import BOXING_KEYPOINT_INDICES, PoseEngine
@@ -56,9 +58,9 @@ def configure_cpu_runtime() -> int:
     available = max(1, int(os.cpu_count() or 1))
     requested = os.getenv("CORNERCOACH_CPU_THREADS", "").strip()
     try:
-        thread_count = int(requested) if requested else min(8, available)
+        thread_count = int(requested) if requested else min(4, available)
     except ValueError:
-        thread_count = min(8, available)
+        thread_count = min(4, available)
     thread_count = max(1, min(thread_count, available))
     cv2.setNumThreads(1)
     torch.set_num_threads(thread_count)
@@ -92,6 +94,58 @@ def load_trained_recognizer() -> TrainedPunchRecognizer:
         checkpoint_path=PROJECT_ROOT / "weights" / "stgcn" / "best_checkpoint.pt",
         model_kind="stgcn",
         device="cpu",
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def get_inference_coordinator() -> InferenceCoordinator:
+    """Return the process-wide FIFO gate protecting mutable model state."""
+    return InferenceCoordinator()
+
+
+def _start_inference_job(
+    filename: str,
+) -> tuple[InferenceCoordinator, InferenceTicket, float]:
+    """Wait for the single cloud worker without allowing state corruption."""
+    coordinator = get_inference_coordinator()
+    job_id = f"{Path(filename).name}:{uuid.uuid4().hex[:10]}"
+    wait_notice = st.empty()
+    queued_at = time.perf_counter()
+
+    def show_waiting(position: int) -> None:
+        noun = "job" if position == 1 else "jobs"
+        wait_notice.info(
+            "Another video or image is currently being analyzed. "
+            f"Your upload is queued with {position} {noun} ahead; keep this tab open."
+        )
+
+    ticket = coordinator.acquire(job_id, on_wait=show_waiting)
+    wait_seconds = time.perf_counter() - queued_at
+    wait_notice.empty()
+    if ticket.waited:
+        st.info("The inference worker is available. Your analysis is starting now.")
+    LOGGER.info(
+        "INFERENCE_ACQUIRED job=%s initial_position=%d wait_seconds=%.3f",
+        ticket.job_id,
+        ticket.initial_position,
+        wait_seconds,
+    )
+    return coordinator, ticket, time.perf_counter()
+
+
+def _finish_inference_job(
+    coordinator: InferenceCoordinator,
+    ticket: InferenceTicket,
+    started_at: float,
+) -> None:
+    """Always release the shared worker, including after an analysis failure."""
+    elapsed = time.perf_counter() - started_at
+    coordinator.release(ticket)
+    LOGGER.info(
+        "INFERENCE_RELEASED job=%s run_seconds=%.3f waiting_jobs=%d",
+        ticket.job_id,
+        elapsed,
+        coordinator.waiting_jobs,
     )
 
 
@@ -140,6 +194,24 @@ def _keypoint_rows(keypoints: dict[str, np.ndarray] | None) -> list[dict[str, An
 
 
 def process_image(uploaded_file: Any, pipeline: TrackedBoxerPosePipeline) -> None:
+    """Run image analysis with the same exclusive worker used by videos."""
+    coordinator, inference_ticket, inference_job_started = _start_inference_job(
+        uploaded_file.name
+    )
+    try:
+        _process_image_unlocked(uploaded_file, pipeline)
+    finally:
+        _finish_inference_job(
+            coordinator,
+            inference_ticket,
+            inference_job_started,
+        )
+
+
+def _process_image_unlocked(
+    uploaded_file: Any,
+    pipeline: TrackedBoxerPosePipeline,
+) -> None:
     """Decode, analyze, and render one uploaded image."""
     image_bytes = np.frombuffer(uploaded_file.getvalue(), dtype=np.uint8)
     frame = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
@@ -374,10 +446,10 @@ def _analysis_settings_panel() -> dict[str, Any]:
         cpu_batch_size = st.select_slider(
             "CPU inference batch size",
             options=[1, 2, 4, 8, 12, 16],
-            value=8,
+            value=4,
             help=(
-                "Batches both YOLO stages while preserving frame order. Reduce "
-                "this only if the computer runs out of memory."
+                "Batches both YOLO stages while preserving frame order. Four is "
+                "the safer Streamlit Cloud default; eight is faster on larger hosts."
             ),
         )
         model_confidence = st.slider(
@@ -492,7 +564,7 @@ def _analysis_settings_panel() -> dict[str, Any]:
 
 
 def _completed_analysis_key(
-    video_bytes: bytes,
+    video_bytes: bytes | memoryview,
     filename: str,
     settings: dict[str, Any],
 ) -> str:
@@ -701,7 +773,9 @@ def process_video(
 ) -> None:
     """Analyze an uploaded video, showing live frames and an annotated result."""
     active_settings = settings or _analysis_settings_panel()
-    source_bytes = uploaded_file.getvalue()
+    # A memoryview avoids duplicating the complete upload while this session is
+    # waiting in the inference queue on a memory-constrained cloud instance.
+    source_bytes = uploaded_file.getbuffer()
     analysis_key = _completed_analysis_key(
         source_bytes,
         uploaded_file.name,
@@ -718,6 +792,9 @@ def process_video(
     output_path: Path | None = None
     capture: cv2.VideoCapture | None = None
     writer: cv2.VideoWriter | None = None
+    coordinator, inference_ticket, inference_job_started = _start_inference_job(
+        uploaded_file.name
+    )
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as source:
@@ -822,7 +899,7 @@ def process_video(
         flash_label: str | None = None
         flash_until = -1.0
         pending_frames: deque[tuple[np.ndarray, Any]] = deque()
-        cpu_batch_size = max(1, int(active_settings.get("cpu_batch_size", 8)))
+        cpu_batch_size = max(1, int(active_settings.get("cpu_batch_size", 4)))
         inference_started = time.perf_counter()
 
         while True:
@@ -1101,13 +1178,20 @@ def process_video(
         )
 
     finally:
-        if capture is not None:
-            capture.release()
-        if writer is not None:
-            writer.release()
-        for temporary_path in (input_path, intermediate_path, output_path):
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
+        try:
+            if capture is not None:
+                capture.release()
+            if writer is not None:
+                writer.release()
+            for temporary_path in (input_path, intermediate_path, output_path):
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+        finally:
+            _finish_inference_job(
+                coordinator,
+                inference_ticket,
+                inference_job_started,
+            )
 
 
 def main() -> None:
@@ -1118,6 +1202,10 @@ def main() -> None:
     st.caption(
         "Batched two-stage YOLO pose analysis with trained ST-GCN punch "
         f"recognition | CPU threads: {cpu_threads}"
+    )
+    st.caption(
+        "New inference jobs are processed one at a time in upload order so "
+        "simultaneous visitors cannot interrupt each other's analysis."
     )
 
     uploaded_file = st.file_uploader(
