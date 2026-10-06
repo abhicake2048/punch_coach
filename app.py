@@ -423,7 +423,8 @@ def _transcode_browser_mp4(
     ]
     process = subprocess.Popen(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
     stdout = ""
