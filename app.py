@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 import logging
 import hashlib
 import json
@@ -10,7 +11,6 @@ import os
 import subprocess
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,8 @@ import cv2
 import numpy as np
 import streamlit as st
 import torch
+from streamlit.runtime import Runtime
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from core.kinematics import (
     PoseSignalProcessor,
@@ -31,7 +33,7 @@ from core.coaching_report import (
 )
 from core.fatigue_analyzer import FatigueAnalyzer, FatigueReport
 from core.guard_monitor import GuardMonitor
-from core.inference_coordinator import InferenceCoordinator, InferenceTicket
+from core.inference_coordinator import InferenceCoordinator, InferenceLease
 from core.logging_config import configure_logging
 from core.boxer_pipeline import TrackedBoxerPosePipeline
 from core.pose_engine import BOXING_KEYPOINT_INDICES, PoseEngine
@@ -50,6 +52,30 @@ YOLO_WEIGHTS = PROJECT_ROOT / "weights" / "yolo11s-pose.pt"
 ANALYSIS_SCHEMA_VERSION = "top-down-cpu-pdf-v3"
 LOG_PATH = configure_logging()
 LOGGER = logging.getLogger("cornercoach.app")
+
+
+def _positive_env_float(name: str, default: float, minimum: float) -> float:
+    """Read a positive duration setting without making deployment fragile."""
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+QUEUE_POLL_SECONDS = _positive_env_float(
+    "CORNERCOACH_QUEUE_POLL_SECONDS", 1.0, 0.25
+)
+QUEUE_LEASE_SECONDS = _positive_env_float(
+    "CORNERCOACH_QUEUE_LEASE_SECONDS", 20.0, 5.0
+)
+MAX_JOB_SECONDS = _positive_env_float(
+    "CORNERCOACH_MAX_JOB_SECONDS", 2700.0, 60.0
+)
+QUEUE_STATE_KEY = "_cornercoach_inference_job"
+
+
+class InferenceCancelled(RuntimeError):
+    """Raised at a safe batch boundary when a browser abandons its job."""
 
 
 @st.cache_resource(show_spinner=False)
@@ -99,51 +125,136 @@ def load_trained_recognizer() -> TrainedPunchRecognizer:
 
 @st.cache_resource(show_spinner=False)
 def get_inference_coordinator() -> InferenceCoordinator:
-    """Return the process-wide FIFO gate protecting mutable model state."""
-    return InferenceCoordinator()
+    """Return the process-wide lease queue protecting mutable model state."""
+    return InferenceCoordinator(waiting_timeout_seconds=QUEUE_LEASE_SECONDS)
+
+
+def _current_session_id() -> str:
+    """Return the browser connection ID backing the current Streamlit run."""
+    context = get_script_run_ctx(suppress_warning=True)
+    if context is None:
+        raise RuntimeError("Inference must run inside an active Streamlit session")
+    return context.session_id
+
+
+def _session_is_active(session_id: str) -> bool | None:
+    """Use Streamlit's thread-safe registry to detect a closed browser tab."""
+    try:
+        if not Runtime.exists():
+            return True
+        return bool(Runtime.instance().is_active_session(session_id))
+    except Exception:
+        # The waiting lease still evicts abandoned queue entries if a future
+        # Streamlit release changes this internal runtime API.
+        LOGGER.warning("SESSION_ACTIVITY_CHECK_FAILED session=%s", session_id)
+        return None
 
 
 def _start_inference_job(
     filename: str,
-) -> tuple[InferenceCoordinator, InferenceTicket, float]:
-    """Wait for the single cloud worker without allowing state corruption."""
+    request_key: str,
+) -> tuple[InferenceCoordinator, InferenceLease]:
+    """Register/poll a browser-owned job and claim the worker without blocking."""
     coordinator = get_inference_coordinator()
-    job_id = f"{Path(filename).name}:{uuid.uuid4().hex[:10]}"
-    wait_notice = st.empty()
-    queued_at = time.perf_counter()
+    session_id = _current_session_id()
+    coordinator.prune(_session_is_active)
 
-    def show_waiting(position: int) -> None:
-        noun = "job" if position == 1 else "jobs"
-        wait_notice.info(
-            "Another video or image is currently being analyzed. "
-            f"Your upload is queued with {position} {noun} ahead; keep this tab open."
+    saved_job = st.session_state.get(QUEUE_STATE_KEY)
+    if (
+        not isinstance(saved_job, dict)
+        or saved_job.get("request_key") != request_key
+        or saved_job.get("session_id") != session_id
+    ):
+        if isinstance(saved_job, dict) and saved_job.get("job_id"):
+            coordinator.request_cancel(
+                str(saved_job["job_id"]),
+                str(saved_job.get("session_id", session_id)),
+            )
+        saved_job = {
+            "request_key": request_key,
+            "job_id": f"{session_id}:{request_key[:20]}",
+            "session_id": session_id,
+            "filename": Path(filename).name,
+        }
+        st.session_state[QUEUE_STATE_KEY] = saved_job
+
+    job_id = str(saved_job["job_id"])
+    coordinator.register(job_id, session_id)
+    status = coordinator.touch(job_id, session_id)
+    lease = coordinator.try_start(job_id, session_id)
+    if lease is not None:
+        wait_seconds = max(0.0, lease.started_at - lease.queued_at)
+        if lease.waited:
+            st.info("The inference worker is available. Your analysis is starting now.")
+        LOGGER.info(
+            "INFERENCE_ACQUIRED job=%s initial_position=%d wait_seconds=%.3f",
+            lease.job_id,
+            lease.initial_position,
+            wait_seconds,
         )
+        return coordinator, lease
 
-    ticket = coordinator.acquire(job_id, on_wait=show_waiting)
-    wait_seconds = time.perf_counter() - queued_at
-    wait_notice.empty()
-    if ticket.waited:
-        st.info("The inference worker is available. Your analysis is starting now.")
-    LOGGER.info(
-        "INFERENCE_ACQUIRED job=%s initial_position=%d wait_seconds=%.3f",
-        ticket.job_id,
-        ticket.initial_position,
-        wait_seconds,
+    if status is None:
+        # A stale lease may be pruned between browser reruns. Re-registering puts
+        # the still-connected session back in the live queue instead of hanging.
+        status = coordinator.register(job_id, session_id)
+
+    jobs_ahead = max(0, status.jobs_ahead)
+    queue_position = jobs_ahead + 1
+    total_jobs = max(queue_position, status.total_jobs)
+    starting_ahead = max(1, status.initial_position)
+    queue_progress = min(0.99, max(0.0, (starting_ahead - jobs_ahead) / starting_ahead))
+    noun = "job" if jobs_ahead == 1 else "jobs"
+    st.info(
+        "The CPU inference worker is busy. Your upload is waiting in the live "
+        f"queue with {jobs_ahead} {noun} ahead."
     )
-    return coordinator, ticket, time.perf_counter()
+    st.progress(
+        queue_progress,
+        text=f"Queue position {queue_position} of {total_jobs}",
+    )
+    st.caption(
+        "This updates automatically. Closing this tab cancels your queue entry; "
+        "closing the active tab stops that job after its current YOLO batch."
+    )
+    time.sleep(QUEUE_POLL_SECONDS)
+    st.rerun()
+    raise RuntimeError("Streamlit rerun did not stop the waiting script")
+
+
+def _ensure_inference_job_active(
+    coordinator: InferenceCoordinator,
+    lease: InferenceLease,
+) -> None:
+    """Abort safely after a disconnect, explicit cancellation, or time limit."""
+    coordinator.prune(_session_is_active)
+    runtime_seconds = time.monotonic() - lease.started_at
+    if _session_is_active(lease.session_id) is False:
+        coordinator.request_cancel(lease.job_id, lease.session_id)
+        raise InferenceCancelled("The browser tab disconnected; inference was cancelled.")
+    if runtime_seconds > MAX_JOB_SECONDS:
+        coordinator.request_cancel(lease.job_id, lease.session_id)
+        raise InferenceCancelled(
+            f"Inference exceeded the {MAX_JOB_SECONDS / 60:.0f}-minute safety limit."
+        )
+    if coordinator.cancellation_requested(lease.job_id):
+        raise InferenceCancelled("Inference was cancelled and the next queued job may run.")
 
 
 def _finish_inference_job(
     coordinator: InferenceCoordinator,
-    ticket: InferenceTicket,
-    started_at: float,
+    lease: InferenceLease,
 ) -> None:
-    """Always release the shared worker, including after an analysis failure."""
-    elapsed = time.perf_counter() - started_at
-    coordinator.release(ticket)
+    """Release the worker after success, failure, timeout, or disconnection."""
+    elapsed = time.monotonic() - lease.started_at
+    released = coordinator.finish(lease)
+    saved_job = st.session_state.get(QUEUE_STATE_KEY)
+    if isinstance(saved_job, dict) and saved_job.get("job_id") == lease.job_id:
+        del st.session_state[QUEUE_STATE_KEY]
     LOGGER.info(
-        "INFERENCE_RELEASED job=%s run_seconds=%.3f waiting_jobs=%d",
-        ticket.job_id,
+        "INFERENCE_RELEASED job=%s released=%s run_seconds=%.3f waiting_jobs=%d",
+        lease.job_id,
+        released,
         elapsed,
         coordinator.waiting_jobs,
     )
@@ -195,17 +306,19 @@ def _keypoint_rows(keypoints: dict[str, np.ndarray] | None) -> list[dict[str, An
 
 def process_image(uploaded_file: Any, pipeline: TrackedBoxerPosePipeline) -> None:
     """Run image analysis with the same exclusive worker used by videos."""
-    coordinator, inference_ticket, inference_job_started = _start_inference_job(
-        uploaded_file.name
+    image_digest = hashlib.sha256()
+    image_digest.update(uploaded_file.getbuffer())
+    image_digest.update(uploaded_file.name.encode("utf-8"))
+    coordinator, inference_lease = _start_inference_job(
+        uploaded_file.name,
+        f"image:{image_digest.hexdigest()}",
     )
     try:
+        _ensure_inference_job_active(coordinator, inference_lease)
         _process_image_unlocked(uploaded_file, pipeline)
+        _ensure_inference_job_active(coordinator, inference_lease)
     finally:
-        _finish_inference_job(
-            coordinator,
-            inference_ticket,
-            inference_job_started,
-        )
+        _finish_inference_job(coordinator, inference_lease)
 
 
 def _process_image_unlocked(
@@ -269,7 +382,11 @@ def _process_image_unlocked(
             )
 
 
-def _transcode_browser_mp4(source_path: Path, output_path: Path) -> None:
+def _transcode_browser_mp4(
+    source_path: Path,
+    output_path: Path,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
     """Transcode an OpenCV intermediate into browser-compatible H.264 MP4."""
     try:
         import imageio_ffmpeg
@@ -304,14 +421,33 @@ def _transcode_browser_mp4(source_path: Path, output_path: Path) -> None:
         "+faststart",
         str(output_path),
     ]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         command,
-        check=False,
         capture_output=True,
         text=True,
     )
-    if completed.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
-        details = completed.stderr.strip() or "ffmpeg produced no playable output"
+    stdout = ""
+    stderr = ""
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_check is not None:
+                    cancel_check()
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+        raise
+
+    if process.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        details = stderr.strip() or stdout.strip() or "ffmpeg produced no playable output"
         raise RuntimeError(f"H.264 video conversion failed: {details}")
 
 
@@ -792,11 +928,13 @@ def process_video(
     output_path: Path | None = None
     capture: cv2.VideoCapture | None = None
     writer: cv2.VideoWriter | None = None
-    coordinator, inference_ticket, inference_job_started = _start_inference_job(
-        uploaded_file.name
+    coordinator, inference_lease = _start_inference_job(
+        uploaded_file.name,
+        f"video:{analysis_key}",
     )
 
     try:
+        _ensure_inference_job_active(coordinator, inference_lease)
         with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as source:
             source.write(source_bytes)
             input_path = Path(source.name)
@@ -904,6 +1042,7 @@ def process_video(
 
         while True:
             if not pending_frames:
+                _ensure_inference_job_active(coordinator, inference_lease)
                 frame_batch: list[np.ndarray] = []
                 for _ in range(cpu_batch_size):
                     ok, batch_frame = capture.read()
@@ -918,6 +1057,7 @@ def process_video(
                     detection_size=int(active_settings["detection_size"]),
                     draw_diagnostics=True,
                 )
+                _ensure_inference_job_active(coordinator, inference_lease)
                 if len(stage_batch) != len(frame_batch):
                     raise RuntimeError(
                         "Batched pose pipeline returned a different frame count"
@@ -1132,8 +1272,17 @@ def process_video(
         capture = None
         writer.release()
         writer = None
+        _ensure_inference_job_active(coordinator, inference_lease)
         progress.progress(0.98, text="Creating browser-compatible H.264 video…")
-        _transcode_browser_mp4(intermediate_path, output_path)
+        _transcode_browser_mp4(
+            intermediate_path,
+            output_path,
+            cancel_check=lambda: _ensure_inference_job_active(
+                coordinator,
+                inference_lease,
+            ),
+        )
+        _ensure_inference_job_active(coordinator, inference_lease)
         progress.progress(1.0, text=f"Finished {frame_index:,} frames")
 
         duration_seconds = frame_index / fps
@@ -1187,11 +1336,7 @@ def process_video(
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
         finally:
-            _finish_inference_job(
-                coordinator,
-                inference_ticket,
-                inference_job_started,
-            )
+            _finish_inference_job(coordinator, inference_lease)
 
 
 def main() -> None:
@@ -1204,8 +1349,8 @@ def main() -> None:
         f"recognition | CPU threads: {cpu_threads}"
     )
     st.caption(
-        "New inference jobs are processed one at a time in upload order so "
-        "simultaneous visitors cannot interrupt each other's analysis."
+        "Inference runs one upload at a time in a live FIFO queue. Disconnected "
+        "sessions are cancelled automatically so they cannot block later visitors."
     )
 
     uploaded_file = st.file_uploader(
@@ -1214,6 +1359,13 @@ def main() -> None:
         help="Images are inspected once; videos are processed frame by frame.",
     )
     if uploaded_file is None:
+        saved_job = st.session_state.get(QUEUE_STATE_KEY)
+        if isinstance(saved_job, dict) and saved_job.get("job_id"):
+            get_inference_coordinator().request_cancel(
+                str(saved_job["job_id"]),
+                str(saved_job.get("session_id", "")),
+            )
+            del st.session_state[QUEUE_STATE_KEY]
         st.info("Upload a JPG, PNG, MP4, or MOV file to begin.")
         return
 
@@ -1252,6 +1404,9 @@ def main() -> None:
                 recognizer,
                 settings=settings,
             )
+    except InferenceCancelled as exc:
+        LOGGER.info("ANALYSIS_CANCELLED file=%s reason=%s", uploaded_file.name, exc)
+        st.warning(str(exc))
     except Exception as exc:  # Streamlit should surface model/codec errors cleanly.
         LOGGER.exception("ANALYSIS_FAILED file=%s", uploaded_file.name)
         st.error(f"Analysis failed: {exc}")

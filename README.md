@@ -108,17 +108,40 @@ use 11-frame motion sequences and fast punches may last only 5-8 frames.
 ## Multiple users
 
 The YOLO predictors, boxer tracker, and ST-GCN temporal state are shared to stay
-within small cloud-memory limits, but they are protected by a process-wide FIFO
-coordinator. One upload runs inference at a time. Additional visitors see a
-waiting message and begin automatically in upload order when the worker is
-released. Cached completed results and report viewing remain session-specific
-and do not wait in the inference queue.
+within small cloud-memory limits, so a process-wide lease queue runs one upload
+at a time in FIFO order. Waiting sessions do not block Python threads. Their page
+refreshes the queue state once per second and shows both the live position and a
+queue progress bar. Cached completed results and report viewing remain
+session-specific and do not enter the inference queue.
 
-The worker ticket is released from a nested `finally` block after success,
-invalid media, or an inference exception, preventing one failed upload from
-blocking later users. Streamlit Cloud defaults to batch size 4 and up to four
-PyTorch CPU threads; larger hosts can select batch size 8 or set
-`CORNERCOACH_CPU_THREADS` explicitly.
+Every queue entry belongs to its Streamlit browser session. Closing a waiting
+tab removes that entry as soon as Streamlit reports the disconnect; a 20-second
+heartbeat lease is the fallback if the runtime cannot report it. Closing the
+tab that owns the active analysis requests cancellation. Video inference stops
+after the current YOLO batch returns, temporary files and tracker state are
+cleaned up, and only then is the next visitor allowed to start. H.264
+transcoding is also terminated on disconnect. This ordering prevents a cancelled
+job and its successor from using the shared models at the same time.
+
+The worker lease is released from a nested `finally` block after success,
+invalid media, cancellation, timeout, or an inference exception. A 45-minute
+safety limit prevents an abnormal job from owning the queue indefinitely.
+Streamlit Cloud defaults to batch size 4 and up to four PyTorch CPU threads;
+larger hosts can select batch size 8 or set `CORNERCOACH_CPU_THREADS` explicitly.
+
+The queue timings can be adjusted before launch if the hosting environment needs
+different values:
+
+```bash
+export CORNERCOACH_QUEUE_POLL_SECONDS=1
+export CORNERCOACH_QUEUE_LEASE_SECONDS=20
+export CORNERCOACH_MAX_JOB_SECONDS=2700
+```
+
+The max-job limit and active-tab cancellation are checked at safe batch
+boundaries. Python cannot safely interrupt a PyTorch/OpenCV native call in the
+middle, so cancellation can take as long as the current batch rather than being
+instantaneous.
 
 ## Using the app
 

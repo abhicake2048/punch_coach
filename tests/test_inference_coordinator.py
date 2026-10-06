@@ -1,94 +1,125 @@
 from __future__ import annotations
 
-import threading
-import time
 import unittest
 
 from core.inference_coordinator import InferenceCoordinator
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 class InferenceCoordinatorTests(unittest.TestCase):
-    def test_jobs_run_one_at_a_time_in_fifo_order(self) -> None:
-        coordinator = InferenceCoordinator()
-        barrier = threading.Barrier(4)
-        state_lock = threading.Lock()
-        started: list[int] = []
-        active = 0
-        maximum_active = 0
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        self.coordinator = InferenceCoordinator(
+            waiting_timeout_seconds=20.0,
+            clock=self.clock,
+        )
 
-        def worker(index: int) -> None:
-            nonlocal active, maximum_active
-            barrier.wait()
-            # Stagger ticket requests while still starting the threads together.
-            time.sleep(index * 0.01)
-            ticket = coordinator.acquire(f"job-{index}")
-            try:
-                with state_lock:
-                    started.append(index)
-                    active += 1
-                    maximum_active = max(maximum_active, active)
-                time.sleep(0.03)
-                with state_lock:
-                    active -= 1
-            finally:
-                coordinator.release(ticket)
+    def test_jobs_start_one_at_a_time_in_fifo_order(self) -> None:
+        first = self.coordinator.register("first", "session-1")
+        second = self.coordinator.register("second", "session-2")
+        third = self.coordinator.register("third", "session-3")
 
-        threads = [threading.Thread(target=worker, args=(index,)) for index in range(3)]
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(timeout=2.0)
+        self.assertEqual(first.jobs_ahead, 0)
+        self.assertEqual(second.jobs_ahead, 1)
+        self.assertEqual(third.jobs_ahead, 2)
+        self.assertIsNone(self.coordinator.try_start("second", "session-2"))
 
-        self.assertTrue(all(not thread.is_alive() for thread in threads))
-        self.assertEqual(started, [0, 1, 2])
-        self.assertEqual(maximum_active, 1)
-        self.assertEqual(coordinator.waiting_jobs, 0)
-        self.assertIsNone(coordinator.active_job_id)
+        first_lease = self.coordinator.try_start("first", "session-1")
+        self.assertIsNotNone(first_lease)
+        self.assertIsNone(self.coordinator.try_start("first", "session-1"))
+        self.assertIsNone(self.coordinator.try_start("second", "session-2"))
+        self.assertEqual(self.coordinator.status("second").jobs_ahead, 1)
 
-    def test_release_after_failure_allows_next_job(self) -> None:
-        coordinator = InferenceCoordinator()
-        first = coordinator.acquire("first")
-        result: list[str] = []
+        self.assertTrue(self.coordinator.finish(first_lease))
+        second_lease = self.coordinator.try_start("second", "session-2")
+        self.assertIsNotNone(second_lease)
+        self.assertTrue(self.coordinator.finish(second_lease))
+        third_lease = self.coordinator.try_start("third", "session-3")
+        self.assertIsNotNone(third_lease)
+        self.assertTrue(self.coordinator.finish(third_lease))
+        self.assertEqual(self.coordinator.waiting_jobs, 0)
+        self.assertIsNone(self.coordinator.active_job_id)
 
-        def second_worker() -> None:
-            second = coordinator.acquire("second")
-            try:
-                result.append("second-started")
-            finally:
-                coordinator.release(second)
+    def test_browser_rerun_does_not_duplicate_its_queue_entry(self) -> None:
+        first = self.coordinator.register("same-job", "same-session")
+        self.clock.advance(1.0)
+        refreshed = self.coordinator.register("same-job", "same-session")
 
-        thread = threading.Thread(target=second_worker)
-        thread.start()
-        time.sleep(0.03)
-        self.assertEqual(coordinator.waiting_jobs, 1)
+        self.assertEqual(self.coordinator.waiting_jobs, 1)
+        self.assertEqual(refreshed.job_id, first.job_id)
+        self.assertEqual(refreshed.initial_position, first.initial_position)
+        self.assertEqual(refreshed.waited_seconds, 1.0)
 
-        # This mirrors the app's finally block after a failed analysis.
-        coordinator.release(first)
-        thread.join(timeout=2.0)
+    def test_stale_waiter_is_removed_and_position_shrinks(self) -> None:
+        self.coordinator.register("active", "session-a")
+        active_lease = self.coordinator.try_start("active", "session-a")
+        self.coordinator.register("abandoned", "session-b")
+        self.coordinator.register("connected", "session-c")
 
-        self.assertEqual(result, ["second-started"])
-        self.assertFalse(thread.is_alive())
-        self.assertIsNone(coordinator.active_job_id)
+        self.clock.advance(21.0)
+        self.coordinator.touch("connected", "session-c")
+        removed = self.coordinator.prune()
 
-    def test_cancelled_waiter_does_not_block_the_queue(self) -> None:
-        coordinator = InferenceCoordinator()
-        first = coordinator.acquire("first")
+        self.assertEqual(removed, ["abandoned"])
+        self.assertIsNone(self.coordinator.status("abandoned"))
+        self.assertEqual(self.coordinator.status("connected").jobs_ahead, 1)
+        self.assertTrue(self.coordinator.finish(active_lease))
 
-        with self.assertRaisesRegex(RuntimeError, "session disconnected"):
-            coordinator.acquire(
-                "cancelled",
-                on_wait=lambda _position: (_ for _ in ()).throw(
-                    RuntimeError("session disconnected")
-                ),
-            )
+    def test_disconnected_waiter_is_removed_immediately(self) -> None:
+        self.coordinator.register("active", "session-a")
+        active_lease = self.coordinator.try_start("active", "session-a")
+        self.coordinator.register("closed", "session-b")
+        self.coordinator.register("open", "session-c")
 
-        coordinator.release(first)
-        third = coordinator.acquire("third")
-        coordinator.release(third)
+        removed = self.coordinator.prune(
+            lambda session_id: session_id in {"session-a", "session-c"}
+        )
 
-        self.assertEqual(coordinator.waiting_jobs, 0)
-        self.assertIsNone(coordinator.active_job_id)
+        self.assertEqual(removed, ["closed"])
+        self.assertEqual(self.coordinator.status("open").jobs_ahead, 1)
+        self.assertTrue(self.coordinator.finish(active_lease))
+
+    def test_active_disconnect_waits_for_safe_release(self) -> None:
+        self.coordinator.register("active", "session-a")
+        active_lease = self.coordinator.try_start("active", "session-a")
+        self.coordinator.register("next", "session-b")
+
+        self.coordinator.prune(lambda session_id: session_id == "session-b")
+
+        self.assertTrue(self.coordinator.cancellation_requested("active"))
+        self.assertEqual(self.coordinator.active_job_id, "active")
+        self.assertIsNone(self.coordinator.try_start("next", "session-b"))
+        self.assertTrue(self.coordinator.finish(active_lease))
+        self.assertIsNotNone(self.coordinator.try_start("next", "session-b"))
+
+    def test_cancelled_waiter_cannot_block_the_queue(self) -> None:
+        self.coordinator.register("active", "session-a")
+        active_lease = self.coordinator.try_start("active", "session-a")
+        self.coordinator.register("cancelled", "session-b")
+        self.coordinator.register("next", "session-c")
+
+        self.assertTrue(self.coordinator.request_cancel("cancelled", "session-b"))
+        self.assertIsNone(self.coordinator.status("cancelled"))
+        self.assertEqual(self.coordinator.status("next").jobs_ahead, 1)
+        self.assertTrue(self.coordinator.finish(active_lease))
+        self.assertIsNotNone(self.coordinator.try_start("next", "session-c"))
+
+    def test_wrong_session_cannot_touch_or_cancel_a_job(self) -> None:
+        self.coordinator.register("job", "owner")
+        with self.assertRaisesRegex(RuntimeError, "another session"):
+            self.coordinator.touch("job", "intruder")
+        self.assertFalse(self.coordinator.request_cancel("job", "intruder"))
+        self.assertIsNotNone(self.coordinator.status("job"))
 
 
 if __name__ == "__main__":
